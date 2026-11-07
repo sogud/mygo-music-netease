@@ -676,11 +676,81 @@ export async function comments({ trackId, offset = 0 }) {
   return { comments: (data.comments || []).map(toComment), total: data.total || 0, more: !!data.more };
 }
 
+// Word-timed lyrics (yrc) are served only by the desktop endpoint, and only
+// to a signed-in listener: each line carries the span it is sung over, and
+// each word, a character for CJK, its own. The web endpoint never carries
+// them. A yrc row reads [start, length](start, length, 0)word…, times in
+// milliseconds.
+function parseYRC(text) {
+  const lines = [];
+  for (const row of String(text || "").split(/\r?\n/)) {
+    const line = /^\[(\d+),(\d+)\](.*)$/.exec(row);
+    if (!line) continue;
+    const marks = [];
+    const pattern = /\((\d+),(\d+),[^)]*\)/g;
+    for (let mark; (mark = pattern.exec(line[3])); ) {
+      marks.push({ at: mark.index, after: pattern.lastIndex, start: Number(mark[1]), end: Number(mark[1]) + Number(mark[2]) });
+    }
+    const words = marks
+      .map((mark, i) => ({ start: mark.start, end: mark.end, text: line[3].slice(mark.after, marks[i + 1]?.at) }))
+      .filter((word) => word.text);
+    if (words.length) {
+      lines.push({ start: Number(line[1]), end: Number(line[1]) + Number(line[2]), text: words.map((word) => word.text).join(""), words });
+    }
+  }
+  return lines;
+}
+
+// A word-timed translation arrives as plain timed lines of its own; the one
+// nearest to a line's start, within half a second, is that line's translation.
+function alignTranslations(lines, timed) {
+  const byTime = [];
+  for (const row of String(timed || "").split(/\r?\n/)) {
+    const text = row.replace(/\[\d+:\d+(?:\.\d+)?\]/g, "").trim();
+    const pattern = /\[(\d+):(\d+)(?:\.(\d+))?\]/g;
+    for (let match; (match = pattern.exec(row)); ) {
+      byTime.push({ start: Number(match[1]) * 60000 + Number(match[2]) * 1000 + Number((match[3] || "").padEnd(3, "0").slice(0, 3)), text });
+    }
+  }
+  for (const line of lines) {
+    const nearest = byTime
+      .filter((item) => Math.abs(item.start - line.start) <= 500)
+      .sort((a, b) => Math.abs(a.start - line.start) - Math.abs(b.start - line.start))[0];
+    if (nearest?.text) line.translation = nearest.text;
+  }
+  return lines;
+}
+
+// What a desktop lyric answer becomes: word-timed lines when it has yrc, with
+// the word-timed translation preferred and the line-wise one as the stand-in,
+// and plain LRC otherwise.
+function lyricAnswer(desktop, translation) {
+  const lrc = desktop.lrc?.lyric || "";
+  const lines = parseYRC(desktop.yrc?.lyric);
+  if (!lines.length) return { lrc, translation };
+  return { lines: alignTranslations(lines, desktop.ytlrc?.lyric || translation), lrc, translation };
+}
+
 export async function lyrics({ id }) {
   const identity = trackIdentity(id);
   if (identity.program) return { lrc: "", translation: "" };
   const activeSession = currentSession();
   const generation = epoch;
+  const params = { id: identity.audio, cp: false, tv: 0, lv: 0, rv: 0, kv: 0, yv: 0, ytv: 0, yrv: 0 };
+  const options = { session: activeSession, keepSession: true };
+  const fromDesktop = async () => {
+    const desktop = await eapi("/api/song/lyric/v1", params, options);
+    if (activeSession !== session || generation !== epoch) throw new Error("账号状态已改变，请重试");
+    return lyricAnswer(desktop, desktop.tlyric?.lyric || "");
+  };
+  // Signed in, the desktop endpoint is asked first: it holds everything the
+  // web endpoint holds, plus the word-timed answer, at one request either
+  // way. Signed out, the web endpoint answers, and the desktop one stays as
+  // the fallback for the songs whose web lyrics come up empty.
+  if (activeSession.cookies.MUSIC_U) {
+    const answer = await fromDesktop();
+    if (answer.lines || answer.lrc.trim()) return answer;
+  }
   const data = await request("/api/song/lyric", { id: identity.audio, lv: 1, tv: -1 });
   const lrc = data.lrc?.lyric || "";
   const translation = data.tlyric?.lyric || "";
@@ -688,11 +758,8 @@ export async function lyrics({ id }) {
   // Some songs have empty web lyrics while the desktop endpoint has LRC.
   // Do not treat that empty response as proof that the song is instrumental.
   if (activeSession !== session || generation !== epoch) throw new Error("账号状态已改变，请重试");
-  const desktop = await eapi("/api/song/lyric/v1", {
-    id: identity.audio, cp: false, tv: 0, lv: 0, rv: 0, kv: 0, yv: 0, ytv: 0, yrv: 0,
-  }, { session: activeSession, keepSession: true });
-  if (activeSession !== session || generation !== epoch) throw new Error("账号状态已改变，请重试");
-  return { lrc: desktop.lrc?.lyric || "", translation: desktop.tlyric?.lyric || translation };
+  if (!activeSession.cookies.MUSIC_U) return fromDesktop();
+  return { lrc: "", translation: "" };
 }
 
 export async function stream({ id, quality = "high" }) {

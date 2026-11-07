@@ -323,3 +323,71 @@ test("daily, radar, personalized playlists and continuous FM map to host capabil
   assert.deepEqual(modes, ["DEFAULT", "FAMILIAR", "EXPLORE", "DEFAULT"]);
   await assert.rejects(plugin.stationNext({ id: "unknown" }), { code: "unsupported" });
 });
+
+// Word-timed lyrics come only from the desktop endpoint, and only signed in.
+test("lyrics return word-timed lines for a signed-in listener without touching the web endpoint", async () => {
+  let sawWeb = false;
+  const { plugin } = await setup(async (url, init) => {
+    if (url.includes("/eapi/")) {
+      const { path, data } = decode(init.body);
+      assert.equal(path, "/api/song/lyric/v1");
+      assert.equal(data.header.MUSIC_U, "synthetic-session");
+      return response({
+        code: 200,
+        lrc: { lyric: "[00:01.00]hello world" },
+        tlyric: { lyric: "[00:01.00]你好世界" },
+        yrc: { lyric: "[1000,3000](1000,500,0)he(1500,500,0)llo(2000,1000,0) world" },
+        ytlrc: { lyric: "[00:01.000]你好，世界" },
+      });
+    }
+    sawWeb = true;
+    return response({ code: 200, lrc: { lyric: "" }, tlyric: { lyric: "" } });
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+  const result = await plugin.lyrics({ id: "1" });
+  assert.equal(sawWeb, false);
+  const [line] = result.lines;
+  assert.equal(line.start, 1000);
+  assert.equal(line.end, 4000);
+  assert.equal(line.text, "hello world");
+  assert.equal(line.translation, "你好，世界");
+  assert.deepEqual(line.words.map((word) => [word.start, word.end, word.text]), [
+    [1000, 1500, "he"], [1500, 2000, "llo"], [2000, 3000, " world"],
+  ]);
+});
+
+// No yrc in the answer, plain LRC stands, still without the web round trip.
+test("lyrics fall back to the desktop endpoint's plain LRC when it has no yrc", async () => {
+  const { plugin } = await setup(async (_url, init) => {
+    const { path } = decode(init.body);
+    assert.equal(path, "/api/song/lyric/v1");
+    return response({ code: 200, lrc: { lyric: "[00:01.00]plain" }, tlyric: { lyric: "[00:01.00]纯文本" } });
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+  const result = await plugin.lyrics({ id: "1" });
+  assert.equal(result.lines, undefined);
+  assert.equal(result.lrc, "[00:01.00]plain");
+  assert.equal(result.translation, "[00:01.00]纯文本");
+});
+
+// Signed out, the web endpoint answers and the desktop one stays fallback.
+test("lyrics ask the web endpoint first when signed out, then the desktop endpoint if empty", async () => {
+  const web = { lrc: { lyric: "[00:01.00]web line" }, tlyric: { lyric: "[00:01.00]网页歌词" } };
+  const { plugin } = await setup(async (url) => {
+    assert.ok(!url.includes("/eapi/"));
+    return response({ code: 200, ...web });
+  });
+  const result = await plugin.lyrics({ id: "1" });
+  assert.equal(result.lrc, "[00:01.00]web line");
+  assert.equal(result.translation, "[00:01.00]网页歌词");
+
+  const { plugin: fallback } = await setup(async (url, init) => {
+    if (url.includes("/eapi/")) {
+      const { path, data } = decode(init.body);
+      assert.equal(path, "/api/song/lyric/v1");
+      assert.equal(data.header.MUSIC_U, undefined);
+      return response({ code: 200, lrc: { lyric: "[00:02.00]desktop line" }, tlyric: { lyric: "[00:02.00]桌面歌词" } });
+    }
+    return response({ code: 200, lrc: { lyric: "" }, tlyric: { lyric: "" } });
+  });
+  const empty = await fallback.lyrics({ id: "1" });
+  assert.equal(empty.lrc, "[00:02.00]desktop line");
+});
