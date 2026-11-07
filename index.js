@@ -122,8 +122,16 @@ async function request(path, params = {}, options = {}) {
     headers.Cookie = Object.keys(header).map((key) => `${encodeURIComponent(key)}=${encodeURIComponent(header[key])}`).join("; ");
   } else {
     url = SITE + path;
-    const query = new URLSearchParams(params).toString();
-    if (query) url += `?${query}`;
+    if (options.form) {
+      // NetEase's web endpoints take these as a form POST with the session
+      // cookie, not as a query string.
+      init.method = "POST";
+      init.body = options.form;
+      headers["Content-Type"] = "application/x-www-form-urlencoded";
+    } else {
+      const query = new URLSearchParams(params).toString();
+      if (query) url += `?${query}`;
+    }
     const cookie = cookieHeader(activeSession.cookies);
     if (cookie) headers.Cookie = cookie;
   }
@@ -148,7 +156,7 @@ async function request(path, params = {}, options = {}) {
   const code = Number(body.code);
   const allowed = options.codes || [200];
   if (!allowed.includes(code)) {
-    if ([301, 302, 401].includes(code)) {
+    if ([301, 302, 401].includes(code) && !options.keepSession) {
       if (activeSession === session) clearSession();
       throw fail("signIn", "请重新登录网易云音乐");
     }
@@ -158,7 +166,10 @@ async function request(path, params = {}, options = {}) {
       throw error;
     }
     if (code === 405) throw new Error("网易云暂时限制了请求，请稍后再试");
-    throw new Error(`网易云接口返回错误（${Number.isFinite(code) ? code : "未知"}）`);
+    // Keep what NetEase said: for playlist edits it explains a refusal better
+    // than the number alone.
+    const said = typeof body.message === "string" && body.message ? `：${body.message}` : "";
+    throw new Error(`网易云接口返回错误（${Number.isFinite(code) ? code : "未知"}）${said}`);
   }
   const wasSignedIn = !!activeSession.cookies.MUSIC_U;
   acceptCookies(response, activeSession.cookies);
@@ -436,6 +447,59 @@ export async function like({ id, on }) {
   await requireAccount();
   await eapi("/api/radio/like", { alg: "itembased", trackId: idOf(id), like: String(!!on), time: "3" });
   likedCache = null;
+}
+
+// Adding and taking songs out of a playlist the listener owns.
+async function submitTracks(op, pid, ids, activeSession) {
+  const form = new URLSearchParams({ op, pid, imme: "true", trackIds: JSON.stringify(ids.map(Number)) });
+  if (activeSession.cookies.__csrf) form.set("csrf_token", activeSession.cookies.__csrf);
+  try {
+    // A refused edit is not a sign-out: keepSession stops a 401 body code from
+    // clearing the listener's session.
+    return await request("/api/playlist/manipulate/tracks", {}, {
+      form: form.toString(), keepSession: true, codes: [200, 502],
+    });
+  } catch (error) {
+    throw new Error(`${op === "add" ? "添加到歌单" : "移出歌单"}失败：${error.message}`);
+  }
+}
+
+async function playlistTrackIDs(pid) {
+  const data = await request("/api/v6/playlist/detail", { id: pid, n: PLAYLIST_LIMIT });
+  return ((data.playlist && data.playlist.trackIds) || []).map((track) => String(track.id));
+}
+
+// NetEase answers a repeat add with 502 and adds nothing, even when the batch
+// also holds songs the playlist is missing. Send what is missing instead, and
+// say so plainly when nothing was.
+async function manipulateTracks(op, id, trackIds) {
+  const activeSession = currentSession();
+  if (!activeSession.cookies.MUSIC_U) throw fail("signIn", "请先扫码登录网易云音乐");
+  const pid = idOf(id);
+  const ids = [...new Set((trackIds || []).map((trackId) => idOf(trackId)))];
+  if (!ids.length) return;
+  let data = await submitTracks(op, pid, ids, activeSession);
+  if (op === "add" && Number(data.code) === 502) {
+    const present = new Set(await playlistTrackIDs(pid));
+    const missing = ids.filter((trackId) => !present.has(trackId));
+    if (!missing.length) {
+      throw fail("duplicate", ids.length > 1 ? "这些歌曲已经在这个歌单里了" : "这首歌已经在这个歌单里了");
+    }
+    data = await submitTracks(op, pid, missing, activeSession);
+    if (Number(data.code) === 502) throw fail("duplicate", "这些歌曲已经在这个歌单里了");
+  }
+  if (Number(data.code) !== 200) {
+    const said = typeof data.message === "string" && data.message ? `：${data.message}` : "";
+    throw new Error(`${op === "add" ? "添加到歌单" : "移出歌单"}失败${said}`);
+  }
+}
+
+export async function addToPlaylist({ id, trackIds }) {
+  await manipulateTracks("add", id, trackIds);
+}
+
+export async function removeFromPlaylist({ id, trackIds }) {
+  await manipulateTracks("del", id, trackIds);
 }
 
 export async function lyrics({ id }) {
