@@ -20,3 +20,5 @@
 - [x] 2026-11-06 14:47 UTC · Codex（ChatGPT 委派 / Mac mini）· 新增 `index.js`、`plugin.json`，移植搜索、歌单、歌词、扫码登录、喜欢列表及授权播放；新增 `index.test.mjs`、`pack.py`、README、AGPL 许可和来源说明。8 项测试及上游 `internal/plugin` 测试通过；真实 moejs 验证四类搜索、24 推荐歌单、65 榜单、59 首歌单、歌词、专辑、歌手 50 首/30 专辑、扫码生成及 HTTP 206 音频解码（48000 Hz）。
 - [x] 2026-11-06 14:47 UTC · Codex（ChatGPT 委派 / Mac mini）· 官方 MyGo Music 0.1.6 已安装到 `/Applications/MyGo Music.app`，SHA-256 与官方发布值一致，签名和公证通过；插件 ZIP 通过宿主安装器安装到 `~/Library/Application Support/MyGo Music/plugins/netease/`，原生界面已显示推荐歌单和搜索结果。
 - [ ] 2026-11-06 14:47 UTC · Codex（ChatGPT 委派 / Mac mini）· 用户扫码后的个人歌单、真实喜欢操作、VIP/无损播放权限和重启后的真实会话恢复仍需账号验收；未读取已有其他客户端凭据，未进行真实喜欢/取消喜欢写操作。
+
+- [x] 2026-11-12 10:06 UTC · Codex（ChatGPT 委派 / Mac mini）· v0.1.9 独立修复候选：index.js 隔离扫码期间旧账号请求，喜欢与歌单显式绑定会话，区分响应解析失败与网络错误，保留 ±460 诊断代码；index.test.mjs 三项新增回归在 v0.1.8 失败、修复后通过，既有断言随新消息更新后23项通过；MyGo 0.1.22 实际 moejs 列表/喜欢检查通过。真实只读喜欢30首、播客13个成功，取流仍失败，登录文件未改；无真实换账号/UI验收，不声称解决460或重启红心。未混入待验收功能。

@@ -318,7 +318,7 @@ test("stream bounds persistent 460 retries and releases the in-flight entry", as
     if (calls <= 2) return response({ code: -460 });
     return response({ code: 200, data: [{ id: 1, url: "https://m1.music.126.net/song.mp3", freeTrialInfo: null }] });
   });
-  await assert.rejects(plugin.stream({ id: "1" }), /仍拒绝播放请求（-460）/);
+  await assert.rejects(plugin.stream({ id: "1" }), { neteaseCode: -460 });
   assert.equal(calls, 2);
   assert.equal((await plugin.stream({ id: "1" })).type, "mp3");
   assert.equal(calls, 3);
@@ -666,5 +666,48 @@ test("late liked-list reads cannot overwrite a successful like or unlike", async
     await assert.rejects(pending, /喜欢状态已更新/);
     assert.deepEqual(await plugin.isLiked({ ids: ['1'] }), { '1': on });
     assert.equal(reads, 2);
+  }
+});
+
+
+test("request diagnostics distinguish unreadable responses from network errors without leaking data", async()=>{
+ const secret='synthetic-private-response';
+ const {plugin}=await setup(async()=>({ok:true,status:200,json:async()=>{throw new SyntaxError(secret);},headers:{getSetCookie:()=>[]}}));
+ await assert.rejects(plugin.search({query:'fixture'}),e=>e.message.includes('响应无法解析')&&!e.message.includes(secret)&&!e.message.includes('代理'));
+ const {plugin:network}=await setup(async()=>{throw new Error(secret);});
+ await assert.rejects(network.search({query:'fixture'}),e=>e.message.includes('网络')&&!e.message.includes(secret));
+ const {plugin:http}=await setup(async()=>({ok:false,status:503}));
+ await assert.rejects(http.search({query:'fixture'}),/HTTP 503/);
+});
+
+// The final retry must retain the exact refusal code for safe diagnostics.
+
+test("persistent 460 diagnostics retain the sign of the service code", async()=>{
+ const {plugin}=await setup(async()=>response({code:-460}));
+ await assert.rejects(plugin.stream({id:'1'}),e=>e.neteaseCode===-460&&e.message.startsWith('[-460]'));
+});
+
+test("QR account switch rejects old likes and playlists still in flight", async () => {
+  for (const kind of ["likes", "playlists"]) {
+    let release, started;
+    const ready = new Promise(resolve => { started = resolve; });
+    const gate = new Promise(resolve => { release = resolve; });
+    const { plugin } = await setup(async (url, init) => {
+      if (url.includes("unikey")) return response({ code: 200, unikey: "synthetic-qr" });
+      if (url.includes("qrcode/client/login")) return response({ code: 803 }, ["MUSIC_U=synthetic-new; Path=/"]);
+      if (url.includes("account/get")) return response({ code: 200, profile: { userId: init.headers.Cookie.includes("synthetic-new") ? 9 : 8, nickname: "Fixture" } });
+      started();
+      await gate;
+      return response(kind === "likes" ? { code: 200, ids: [1] } : { code: 200, playlist: [{ id: 1, name: "Old account" }], more: false });
+    }, { cookies: { MUSIC_U: "synthetic-old" }, profile: null });
+    await plugin.account();
+    const login = plugin.signIn();
+    const oldRequest = kind === "likes" ? plugin.isLiked({ ids: ["1"] }) : plugin.playlists();
+    await ready;
+    assert.equal((await login).id, "9");
+    const rejected = assert.rejects(oldRequest, /账号状态已改变/);
+    release();
+    await rejected;
+    assert.equal((await plugin.account()).id, "9");
   }
 });
