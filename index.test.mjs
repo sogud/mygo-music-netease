@@ -669,7 +669,68 @@ test("late liked-list reads cannot overwrite a successful like or unlike", async
   }
 });
 
+test("cloud pages preserve private tracks without public detail lookup", async () => {
+  const offsets = [];
+  const { plugin } = await setup(async (url) => {
+    if (url.includes('account/get')) return response({ code: 200, profile: { userId: 8, nickname: 'Fixture' } });
+    assert.ok(url.includes('/api/v1/cloud/get'));
+    const offset=Number(new URL(url).searchParams.get('offset'));offsets.push(offset);
+    return response({code:200,data:[{songId:101+offset,songName:'Private',simpleSong:{id:101+offset,fee:1,ar:[],al:{}}}],hasMore:offset===0});
+  },{cookies:{MUSIC_U:'synthetic-session'},profile:null});
+  const first=await plugin.browse({page:'cloud:0'});
+  assert.equal(first.sections[0].tracks[0].id,'101');
+  assert.equal(first.sections[0].tracks[0].unavailable,false);
+  assert.equal(first.sections[0].morePage,'cloud:1');
+  assert.equal((await plugin.browse({page:'cloud:1'})).sections[0].morePage,'');
+  assert.deepEqual(offsets,[0,1]);
+});
 
+test("weekly and all-time records use distinct server types and retain rank order", async () => {
+  const types=[];
+  const {plugin}=await setup(async url=>{
+    if(url.includes('account/get'))return response({code:200,profile:{userId:8,nickname:'Fixture'}});
+    const type=Number(new URL(url).searchParams.get('type'));types.push(type);
+    return response({code:200,[type===1?'weekData':'allData']:[{song:song(2)},{song:song(1)}]});
+  },{cookies:{MUSIC_U:'synthetic-session'},profile:null});
+  for(const page of ['record:week','record:all'])assert.deepEqual((await plugin.browse({page})).sections[0].tracks.map(t=>t.id),['2','1']);
+  assert.deepEqual(types,[1,0]);
+});
+
+test("hot comments and chronological pagination never skip or duplicate comments", async () => {
+  const item=id=>({commentId:id,content:`C${id}`,likedCount:id,user:{}});
+  const offsets=[];
+  const {plugin}=await setup(async url=>{
+    if(url.includes('/hotcomments/'))return response({code:200,hotComments:Array.from({length:20},(_,i)=>item(i+1))});
+    const offset=Number(new URL(url).searchParams.get('offset'));offsets.push(offset);
+    return response({code:200,comments:Array.from({length:Math.min(30,65-offset)},(_,i)=>item(offset+i+1)),total:65,more:offset+30<65});
+  });
+  const a=await plugin.comments({trackId:'1'});
+  const [b,again]=await Promise.all([plugin.comments({trackId:'1',offset:30}),plugin.comments({trackId:'1',offset:30})]);
+  const c=await plugin.comments({trackId:'1',offset:60});
+  assert.deepEqual(a.comments.slice(0,20).map(x=>x.id),Array.from({length:20},(_,i)=>String(20-i)));
+  assert.deepEqual(b.comments,again.comments);
+  const ids=[...a.comments,...b.comments,...c.comments].map(x=>x.id);
+  assert.equal(ids.length,65);assert.equal(new Set(ids).size,65);
+  assert.deepEqual(offsets,[0,30,60]);assert.equal(c.more,false);
+});
+
+test("stream accepts supported AAC containers but still rejects trials", async () => {
+  for(const type of ['m4a','mp4','aac']){
+    const {plugin}=await setup(async()=>response({code:200,data:[{id:1,code:200,url:`https://m1.music.126.net/song.${type}`,type,freeTrialInfo:null}]}));
+    assert.equal((await plugin.stream({id:'1'})).type,type);
+    const {plugin:trial}=await setup(async()=>response({code:200,data:[{id:1,code:200,url:`https://m1.music.126.net/song.${type}`,type,freeTrialInfo:{start:0,end:30}}]}));
+    await assert.rejects(trial.stream({id:'1'}),{code:'unavailable'});
+  }
+});
+
+test("cloud and records require login and reject missing list payloads", async()=>{
+ const {plugin:guest}=await setup(async()=>{throw Error('unexpected guest request');});
+ for(const page of ['cloud:0','record:week','record:all'])await assert.rejects(guest.browse({page}),{code:'signIn'});
+ const {plugin}=await setup(async url=>response(url.includes('account/get')?{code:200,profile:{userId:8,nickname:'Fixture'}}:{code:200}),{cookies:{MUSIC_U:'synthetic-session'},profile:null});
+ for(const page of ['cloud:0','record:week','record:all'])await assert.rejects(plugin.browse({page}),/未返回有效/);
+});
+
+// A non-JSON server response is different from failure to connect; neither may expose its contents.
 test("request diagnostics distinguish unreadable responses from network errors without leaking data", async()=>{
  const secret='synthetic-private-response';
  const {plugin}=await setup(async()=>({ok:true,status:200,json:async()=>{throw new SyntaxError(secret);},headers:{getSetCookie:()=>[]}}));
@@ -681,12 +742,35 @@ test("request diagnostics distinguish unreadable responses from network errors w
 });
 
 // The final retry must retain the exact refusal code for safe diagnostics.
-
 test("persistent 460 diagnostics retain the sign of the service code", async()=>{
  const {plugin}=await setup(async()=>response({code:-460}));
  await assert.rejects(plugin.stream({id:'1'}),e=>e.neteaseCode===-460&&e.message.startsWith('[-460]'));
 });
 
+test("comment retry keeps its server cursor and a repeated page is bounded", async()=>{
+ const item=id=>({commentId:id,content:`C${id}`,user:{}});
+ let failed=false;const offsets=[];
+ const {plugin}=await setup(async url=>{
+  if(url.includes('/hotcomments/'))return response({code:200,hotComments:[]});
+  const offset=Number(new URL(url).searchParams.get('offset'));offsets.push(offset);
+  if(offset===30&&!failed){failed=true;throw Error('synthetic transport failure');}
+  return response({code:200,comments:Array.from({length:30},(_,i)=>item(offset+i+1)),total:60,more:offset===0});
+ });
+ const first=await plugin.comments({trackId:'1'});
+ await assert.rejects(plugin.comments({trackId:'1',offset:30}));
+ const second=await plugin.comments({trackId:'1',offset:30});
+ assert.equal(new Set([...first.comments,...second.comments].map(c=>c.id)).size,60);
+ assert.deepEqual(offsets,[0,30,30]);
+ let calls=0;
+ const {plugin:stalled}=await setup(async url=>{
+  if(url.includes('/hotcomments/'))return response({code:200,hotComments:[]});
+  calls++;return response({code:200,comments:[item(1)],total:100,more:true});
+ });
+ await assert.rejects(stalled.comments({trackId:'1'}),/完整的评论列表/);
+ assert.equal(calls,3);
+});
+
+// Requests started while a QR login is pending still belong to the old account.
 test("QR account switch rejects old likes and playlists still in flight", async () => {
   for (const kind of ["likes", "playlists"]) {
     let release, started;
@@ -709,14 +793,5 @@ test("QR account switch rejects old likes and playlists still in flight", async 
     release();
     await rejected;
     assert.equal((await plugin.account()).id, "9");
-  }
-});
-
-test("stream accepts supported AAC containers but still rejects trials", async () => {
-  for(const type of ['m4a','mp4','aac']){
-    const {plugin}=await setup(async()=>response({code:200,data:[{id:1,code:200,url:`https://m1.music.126.net/song.${type}`,type,freeTrialInfo:null}]}));
-    assert.equal((await plugin.stream({id:'1'})).type,type);
-    const {plugin:trial}=await setup(async()=>response({code:200,data:[{id:1,code:200,url:`https://m1.music.126.net/song.${type}`,type,freeTrialInfo:{start:0,end:30}}]}));
-    await assert.rejects(trial.stream({id:'1'}),{code:'unavailable'});
   }
 });

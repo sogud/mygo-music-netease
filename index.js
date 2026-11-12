@@ -25,6 +25,7 @@ const pendingStreams = new Map();
 let discoveryCovers = null;
 let heartState = null;
 let pendingHeart = null;
+let commentSnapshot = null;
 
 function currentSession() {
   if (!session) session = host.storage.get("session") || { cookies: {}, profile: null };
@@ -444,6 +445,11 @@ export async function home() {
   return {
     title: "发现音乐", subtitle: "网易云音乐 · 发现喜欢的音乐",
     sections: [
+      { title: "我的音乐", links: [
+        { title: "最近一周", subtitle: "听歌排行", page: "record:week" },
+        { title: "所有时间", subtitle: "听歌排行", page: "record:all" },
+        { title: "音乐云盘", subtitle: "我的云盘歌曲", page: "cloud:0" },
+      ] },
       { title: "为你推荐", links: [
         { title: "每日推荐", subtitle: "每天更新，为你推荐好音乐", page: "daily", imageUrl: discoveryCover(0) },
         { title: "私人雷达", subtitle: "发现属于你的音乐", page: "radar", imageUrl: discoveryCover(1) },
@@ -456,6 +462,29 @@ export async function home() {
 }
 
 export async function browse({ page }) {
+  if (/^cloud:\d+$/.test(page)) {
+    await requireAccount();
+    const offset = pageOffset(Number(page.slice(6)));
+    const data = await request("/api/v1/cloud/get", { limit: PAGE_SIZE, offset }, { keepSession: true });
+    if (!Array.isArray(data.data)) throw new Error("网易云未返回有效的云盘列表");
+    const tracks = data.data.map(item => {
+      // Private cloud songs may not exist in the public detail catalogue.
+      const song = item.simpleSong || {};
+      const track = toTrack({ ...song, id: item.songId, name: item.songName || song.name });
+      if (!song.privilege) track.unavailable = false; // Stream still enforces access/trial checks.
+      return track;
+    });
+    if (data.hasMore && !tracks.length) throw new Error("网易云未返回完整的云盘列表");
+    return { title: "音乐云盘", sections: [{ tracks, empty: "云盘暂无歌曲", morePage: data.hasMore ? `cloud:${offset + tracks.length}` : "" }] };
+  }
+  if (page === "record:week" || page === "record:all") {
+    const profile = await requireAccount();
+    const week = page === "record:week";
+    const data = await request("/api/v1/play/record", { uid: profile.id, type: week ? 1 : 0 }, { keepSession: true });
+    const entries = data[week ? "weekData" : "allData"];
+    if (!Array.isArray(entries)) throw new Error("网易云未返回有效的听歌排行");
+    return { title: week ? "最近一周 · 听歌排行" : "所有时间 · 听歌排行", sections: [{ tracks: entries.filter(item => item.song?.id).map(item => toTrack(item.song)), empty: "暂无听歌记录" }] };
+  }
   if (page === "discovery") {
     return { title: "推荐歌单", sections: [{ playlists: await discoveryPlaylists(), empty: "暂时没有推荐歌单" }] };
   }
@@ -716,12 +745,45 @@ export async function removeFromPlaylist({ id, trackIds }) {
 
 export async function comments({ trackId, offset = 0 }) {
   const identity = trackIdentity(trackId);
-  const data = await request(`/api/v1/resource/comments/${identity.thread}`, {
-    limit: PAGE_SIZE, offset: pageOffset(offset),
-  }, { keepSession: true });
-  // Hot comments overlap the chronological list. Adding them here would make
-  // the host skip comments when it advances by the number already displayed.
-  return { comments: (data.comments || []).map(toComment), total: data.total || 0, more: !!data.more };
+  offset = pageOffset(offset);
+  const activeSession = currentSession();
+  if (!commentSnapshot || commentSnapshot.thread !== identity.thread ||
+      commentSnapshot.session !== activeSession || commentSnapshot.epoch !== epoch || offset === 0) {
+    const hot = await request(`/api/v1/resource/hotcomments/${identity.thread}`, {
+      rid: identity.program || identity.audio, limit: 20, offset: 0, beforeTime: 0,
+    }, { session: activeSession, keepSession: true });
+    const items = (hot.hotComments || []).slice().sort((a, b) => (b.likedCount || 0) - (a.likedCount || 0)).slice(0, 20);
+    const unique = new Map(items.map(item => [String(item.commentId), item]));
+    commentSnapshot = { thread: identity.thread, session: activeSession, epoch, items: [...unique.values()], seen: new Set(unique.keys()), cursor: 0, more: true, total: 0 };
+  }
+  const state = commentSnapshot;
+  // Host offsets count displayed comments, not raw chronological records.
+  // Retain both cursors so overlap with hot comments never skips a record.
+  const pending = (state.pending || Promise.resolve()).catch(() => {}).then(async () => {
+    let stagnantPages = 0;
+    for (let pages = 0; state.items.length < offset + PAGE_SIZE && state.more; pages++) {
+      if (pages >= 50) throw new Error("评论分页过多，请重新打开评论后重试");
+      const data = await request(`/api/v1/resource/comments/${identity.thread}`, {
+        limit: PAGE_SIZE, offset: state.cursor,
+      }, { session: activeSession, keepSession: true });
+      if (!Array.isArray(data.comments) || (data.more && !data.comments.length)) throw new Error("网易云未返回完整的评论列表");
+      const previousSize = state.items.length;
+      for (const item of data.comments) {
+        const id = String(item.commentId);
+        if (!state.seen.has(id)) { state.seen.add(id); state.items.push(item); }
+      }
+      stagnantPages = state.items.length === previousSize ? stagnantPages + 1 : 0;
+      if (data.more && stagnantPages >= 2) throw new Error("网易云未返回完整的评论列表，请稍后重试");
+      state.cursor += data.comments.length;
+      state.more = !!data.more;
+      state.total = data.total || state.items.length;
+    }
+  });
+  state.pending = pending;
+  try { await pending; }
+  finally { if (state.pending === pending) state.pending = null; }
+  if (state.session !== session || state.epoch !== epoch) throw new Error("账号状态已改变，请重试");
+  return { comments: state.items.slice(offset, offset + PAGE_SIZE).map(toComment), total: state.total, more: offset + PAGE_SIZE < state.items.length || state.more };
 }
 
 // Word-timed lyrics (yrc) are served only by the desktop endpoint, and only
