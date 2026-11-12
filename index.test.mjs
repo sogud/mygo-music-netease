@@ -451,4 +451,3 @@ test("stream accepts supported AAC containers but still rejects trials", async (
     await assert.rejects(trial.stream({id:'1'}),{code:'unavailable'});
   }
 });
-
