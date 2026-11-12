@@ -20,6 +20,7 @@ let session = null;
 let epoch = 0;
 let profileCheckedAt = 0;
 let likedCache = null;
+let likedRevision = 0;
 const pendingStreams = new Map();
 let discoveryCovers = null;
 let heartState = null;
@@ -488,13 +489,17 @@ export async function playlist({ id }) {
 export async function shows() {
   await requireAccount();
   const result = new Map();
+  let duplicatePages = 0;
   for (let offset = 0; offset < 2000;) {
     const data = await request("/api/djradio/get/subed", { limit: 100, offset, total: "true" }, { keepSession: true });
     const items = data.djRadios || [];
     const previousSize = result.size;
     for (const item of items) result.set(String(item.id), { ...toShow(item), subscribed: true });
     if (!data.hasMore) return [...result.values()];
-    if (!items.length || result.size === previousSize) {
+    // A changing subscription list can overlap a page. Advance by the raw
+    // count once, but fail if the server keeps returning the same records.
+    duplicatePages = result.size === previousSize ? duplicatePages + 1 : 0;
+    if (!items.length || duplicatePages > 1) {
       throw new Error("网易云未返回完整的播客订阅列表，请稍后重试");
     }
     offset += items.length;
@@ -556,7 +561,9 @@ export async function artist({ id }) {
 async function likedIDs() {
   const profile = await requireAccount();
   if (likedCache && likedCache.uid === profile.id && Date.now() - likedCache.at < 60000) return likedCache.ids;
+  const revision = likedRevision;
   const data = await eapi("/api/song/like/get", { uid: profile.id });
+  if (revision !== likedRevision) throw new Error("喜欢状态已更新，请重试");
   const ids = (data.ids || []).map(String);
   likedCache = { uid: profile.id, ids, at: Date.now() };
   return ids;
@@ -587,6 +594,7 @@ export async function like({ id, on }) {
   if (identity.program) throw fail("unsupported", "暂不支持喜欢或取消喜欢播客节目");
   await requireAccount();
   await eapi("/api/radio/like", { alg: "itembased", trackId: identity.audio, like: String(!!on), time: "3" });
+  likedRevision++;
   likedCache = null;
 }
 

@@ -351,3 +351,51 @@ test("fixed playlist mapping preserves ownership across lists and detail", async
     }
   }
 });
+
+// One overlapping page must not discard later subscriptions; repeated nonprogress stays bounded.
+test("podcast pagination advances past one duplicate page but rejects a stalled feed", async () => {
+  for (const stalled of [false, true]) {
+    const offsets = [];
+    const { plugin } = await setup(async (url) => {
+      if (url.includes('account/get')) return response({ code: 200, profile: { userId: 8, nickname: 'Fixture' } });
+      offsets.push(Number(new URL(url).searchParams.get('offset')));
+      const i = offsets.length - 1;
+      return response({ code: 200, djRadios: [{ id: !stalled && i === 2 ? 2 : 1 }], hasMore: stalled || i < 2 });
+    }, { cookies: { MUSIC_U: 'synthetic-session' }, profile: null });
+    if (stalled) {
+      await assert.rejects(plugin.shows(), /完整的播客订阅列表/);
+      assert.equal(offsets.length, 3);
+    } else {
+      assert.deepEqual((await plugin.shows()).map(x => x.id), ['1', '2']);
+      assert.deepEqual(offsets, [0, 1, 2]);
+    }
+  }
+});
+
+// A response started before a successful like/unlike must not restore the old cache.
+test("late liked-list reads cannot overwrite a successful like or unlike", async () => {
+  for (const on of [true, false]) {
+    let release, started;
+    const ready = new Promise(resolve => { started = resolve; });
+    let reads = 0;
+    const { plugin } = await setup(async (url, init) => {
+      if (url.includes('account/get')) return response({ code: 200, profile: { userId: 8, nickname: 'Fixture' } });
+      const { path } = decode(init.body);
+      if (path === '/api/radio/like') return response({ code: 200 });
+      assert.equal(path, '/api/song/like/get');
+      reads++;
+      if (reads === 1) {
+        started();
+        return new Promise(resolve => { release = () => resolve(response({ code: 200, ids: on ? [] : [1] })); });
+      }
+      return response({ code: 200, ids: on ? [1] : [] });
+    }, { cookies: { MUSIC_U: 'synthetic-session' }, profile: null });
+    const pending = plugin.isLiked({ ids: ['1'] });
+    await ready;
+    await plugin.like({ id: '1', on });
+    release();
+    await assert.rejects(pending, /喜欢状态已更新/);
+    assert.deepEqual(await plugin.isLiked({ ids: ['1'] }), { '1': on });
+    assert.equal(reads, 2);
+  }
+});
