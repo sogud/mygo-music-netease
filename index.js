@@ -162,6 +162,7 @@ async function request(path, params = {}, options = {}) {
     if (controller.signal.aborted) throw new Error("网易云请求超时，请稍后重试");
     // Never put response bodies, request headers or login cookies in errors.
     if (response && !response.ok) throw error;
+    if (response) throw new Error("网易云返回的响应无法解析，请稍后重试");
     throw new Error("无法读取网易云音乐，请检查网络及系统代理后重试");
   } finally {
     clearTimeout(timer);
@@ -355,6 +356,9 @@ export async function signIn() {
       if (!pending.profile) throw new Error("无法读取已登录账号，请重新扫码");
       if (startedEpoch !== epoch) break;
       session = pending;
+      // Reject requests started against the previous account during QR login.
+      epoch++;
+      pendingStreams.clear();
       heartState = null;
       pendingHeart = null;
       profileCheckedAt = Date.now();
@@ -460,12 +464,18 @@ export async function browse({ page }) {
 }
 
 export async function playlists() {
+  const activeSession = currentSession();
+  const generation = epoch;
   const profile = await account();
   if (!profile) return [];
+  checkAccountSession(activeSession, generation);
   // Return all pages instead of silently dropping subscriptions after 200.
   const result = [];
   for (let offset = 0; ; offset += 200) {
-    const data = await request("/api/user/playlist", { uid: profile.id, limit: 200, offset });
+    const data = await request("/api/user/playlist", { uid: profile.id, limit: 200, offset }, {
+      session: activeSession, keepSession: true,
+    });
+    checkAccountSession(activeSession, generation);
     const items = data.playlist || [];
     result.push(...items.map(toPlaylist));
     if (!data.more || items.length < 200) return result;
@@ -559,10 +569,14 @@ export async function artist({ id }) {
 }
 
 async function likedIDs() {
+  const activeSession = currentSession();
+  const generation = epoch;
   const profile = await requireAccount();
+  checkAccountSession(activeSession, generation);
   if (likedCache && likedCache.uid === profile.id && Date.now() - likedCache.at < 60000) return likedCache.ids;
   const revision = likedRevision;
-  const data = await eapi("/api/song/like/get", { uid: profile.id });
+  const data = await eapi("/api/song/like/get", { uid: profile.id }, { session: activeSession, keepSession: true });
+  checkAccountSession(activeSession, generation);
   if (revision !== likedRevision) throw new Error("喜欢状态已更新，请重试");
   const ids = (data.ids || []).map(String);
   likedCache = { uid: profile.id, ids, at: Date.now() };
@@ -592,27 +606,33 @@ export async function isLiked({ ids }) {
 export async function like({ id, on }) {
   const identity = trackIdentity(id);
   if (identity.program) throw fail("unsupported", "暂不支持喜欢或取消喜欢播客节目");
+  const activeSession = currentSession();
+  const generation = epoch;
   await requireAccount();
-  await eapi("/api/radio/like", { alg: "itembased", trackId: identity.audio, like: String(!!on), time: "3" });
+  checkAccountSession(activeSession, generation);
+  await eapi("/api/radio/like", { alg: "itembased", trackId: identity.audio, like: String(!!on), time: "3" }, {
+    session: activeSession, keepSession: true,
+  });
+  checkAccountSession(activeSession, generation);
   likedRevision++;
   likedCache = null;
 }
 
-function checkPlaylistSession(activeSession, generation) {
+function checkAccountSession(activeSession, generation) {
   if (generation !== epoch || activeSession !== session) {
     throw new Error("账号状态已改变，请重试");
   }
 }
 
 async function submitPlaylistTracks(op, id, ids, activeSession, generation) {
-  checkPlaylistSession(activeSession, generation);
+  checkAccountSession(activeSession, generation);
   const form = new URLSearchParams({ op, pid: id, imme: "true", trackIds: JSON.stringify(ids.map(Number)) });
   if (activeSession.cookies.__csrf) form.set("csrf_token", activeSession.cookies.__csrf);
   try {
     const data = await request("/api/playlist/manipulate/tracks", {}, {
       session: activeSession, form: form.toString(), keepSession: true, codes: [200, 502],
     });
-    checkPlaylistSession(activeSession, generation);
+    checkAccountSession(activeSession, generation);
     return data;
   } catch (error) {
     // Preserve signIn so the host can offer login; a content 401 keeps session.
@@ -622,11 +642,11 @@ async function submitPlaylistTracks(op, id, ids, activeSession, generation) {
 }
 
 async function playlistTrackIDs(id, activeSession, generation) {
-  checkPlaylistSession(activeSession, generation);
+  checkAccountSession(activeSession, generation);
   const data = await request("/api/v6/playlist/detail", { id, n: PLAYLIST_LIMIT }, {
     session: activeSession, keepSession: true,
   });
-  checkPlaylistSession(activeSession, generation);
+  checkAccountSession(activeSession, generation);
   const source = data.playlist;
   if (String(source?.id) !== id || !Array.isArray(source.trackIds) || source.trackIds.length < source.trackCount) {
     throw new Error("无法确认歌单的完整歌曲列表，请刷新后重试");
@@ -647,7 +667,7 @@ async function manipulatePlaylistTracks(op, id, trackIds) {
   const activeSession = currentSession();
   const generation = epoch;
   await requireAccount();
-  checkPlaylistSession(activeSession, generation);
+  checkAccountSession(activeSession, generation);
   let data = await submitPlaylistTracks(op, pid, ids, activeSession, generation);
   if (op === "add" && Number(data.code) === 502) {
     // A duplicate rejects the whole batch. Only retry songs proved absent;
@@ -728,7 +748,11 @@ async function loadStream(id, quality, generation) {
       break;
     } catch (error) {
       if (![460, -460].includes(error.neteaseCode)) throw error;
-      if (attempt === 1) throw new Error(`网易云仍拒绝播放请求（${error.neteaseCode}），请稍后再试，并在官方客户端确认该歌曲可正常播放`);
+      if (attempt === 1) {
+        const refused = new Error(`[${error.neteaseCode}] 网易云仍拒绝播放请求，请稍后再试，并在官方客户端确认该歌曲可正常播放`);
+        refused.neteaseCode = error.neteaseCode;
+        throw refused;
+      }
       // One delayed retry of this read only, with the same device/account and
       // quality. Never retry account mutations or turn permission failures
       // into a different source, a preview, or a lower-quality success.
