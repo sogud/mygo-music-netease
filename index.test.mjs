@@ -504,3 +504,119 @@ test("fixed playlist mapping preserves ownership across lists and detail", async
     }
   }
 });
+
+// Word-timed lyrics come only from the desktop endpoint, and only signed in.
+test("lyrics return word-timed lines for a signed-in listener without touching the web endpoint", async () => {
+  let sawWeb = false;
+  const { plugin } = await setup(async (url, init) => {
+    if (url.includes("/eapi/")) {
+      const { path, data } = decode(init.body);
+      assert.equal(path, "/api/song/lyric/v1");
+      assert.equal(data.header.MUSIC_U, "synthetic-session");
+      return response({
+        code: 200,
+        lrc: { lyric: "[00:01.00]hello world" },
+        tlyric: { lyric: "[00:01.00]你好世界" },
+        yrc: { lyric: "[1000,3000](1000,500,0)he(1500,500,0)llo(2000,1000,0) world" },
+        ytlrc: { lyric: "[00:01.000]你好，世界" },
+      });
+    }
+    sawWeb = true;
+    return response({ code: 200, lrc: { lyric: "" }, tlyric: { lyric: "" } });
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+  const result = await plugin.lyrics({ id: "1" });
+  assert.equal(sawWeb, false);
+  const [line] = result.lines;
+  assert.equal(line.start, 1000);
+  assert.equal(line.end, 4000);
+  assert.equal(line.text, "hello world");
+  assert.equal(line.translation, "你好，世界");
+  assert.deepEqual(line.words.map((word) => [word.start, word.end, word.text]), [
+    [1000, 1500, "he"], [1500, 2000, "llo"], [2000, 3000, " world"],
+  ]);
+});
+
+// No yrc in the answer, plain LRC stands, still without the web round trip.
+test("lyrics fall back to the desktop endpoint's plain LRC when it has no yrc", async () => {
+  const { plugin } = await setup(async (_url, init) => {
+    const { path } = decode(init.body);
+    assert.equal(path, "/api/song/lyric/v1");
+    return response({ code: 200, lrc: { lyric: "[00:01.00]plain" }, tlyric: { lyric: "[00:01.00]纯文本" } });
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+  const result = await plugin.lyrics({ id: "1" });
+  assert.equal(result.lines, undefined);
+  assert.equal(result.lrc, "[00:01.00]plain");
+  assert.equal(result.translation, "[00:01.00]纯文本");
+});
+
+// Signed out, the web endpoint answers and the desktop one stays fallback.
+test("lyrics ask the web endpoint first when signed out, then the desktop endpoint if empty", async () => {
+  const web = { lrc: { lyric: "[00:01.00]web line" }, tlyric: { lyric: "[00:01.00]网页歌词" } };
+  const { plugin } = await setup(async (url) => {
+    assert.ok(!url.includes("/eapi/"));
+    return response({ code: 200, ...web });
+  });
+  const result = await plugin.lyrics({ id: "1" });
+  assert.equal(result.lrc, "[00:01.00]web line");
+  assert.equal(result.translation, "[00:01.00]网页歌词");
+
+  const { plugin: fallback } = await setup(async (url, init) => {
+    if (url.includes("/eapi/")) {
+      const { path, data } = decode(init.body);
+      assert.equal(path, "/api/song/lyric/v1");
+      assert.equal(data.header.MUSIC_U, undefined);
+      return response({ code: 200, lrc: { lyric: "[00:02.00]desktop line" }, tlyric: { lyric: "[00:02.00]桌面歌词" } });
+    }
+    return response({ code: 200, lrc: { lyric: "" }, tlyric: { lyric: "" } });
+  });
+  const empty = await fallback.lyrics({ id: "1" });
+  assert.equal(empty.lrc, "[00:02.00]desktop line");
+});
+
+// A desktop service failure must not hide usable web lyrics.
+test("lyrics regression: desktop non-auth failure falls back to web", async () => {
+  for (const failure of ["network", "business"]) {
+    const calls = [];
+    const { plugin } = await setup(async (url) => {
+      calls.push(url.includes("/eapi/") ? "desktop" : "web");
+      if (url.includes("/eapi/")) {
+        if (failure === "network") throw new Error("synthetic transport failure");
+        return response({ code: 500 });
+      }
+      return response({ code: 200, lrc: { lyric: "[00:01.00]web original" }, tlyric: { lyric: "[00:01.00]网页翻译" } });
+    }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+    assert.deepEqual(await plugin.lyrics({ id: "1" }), { lrc: "[00:01.00]web original", translation: "[00:01.00]网页翻译" });
+    assert.deepEqual(calls, ["desktop", "web"]);
+  }
+});
+
+// Web translation can be present even when only desktop has original lyrics.
+test("lyrics regression: preserves web translation with desktop original", async () => {
+  for (const yrc of [undefined, { lyric: "[1000,1000](1000,1000,0)original" }]) {
+    const calls = [];
+    const { plugin } = await setup(async (url) => {
+      const desktop = url.includes("/eapi/");
+      calls.push(desktop ? "desktop" : "web");
+      return response(desktop
+        ? { code: 200, lrc: { lyric: "[00:01.00]original" }, yrc }
+        : { code: 200, lrc: { lyric: "" }, tlyric: { lyric: "[00:01.00]网页翻译" } });
+    });
+    const answer = await plugin.lyrics({ id: "1" });
+    assert.equal(answer.lrc, "[00:01.00]original");
+    assert.equal(answer.translation, "[00:01.00]网页翻译");
+    if (yrc) assert.equal(answer.lines[0].translation, "网页翻译");
+    assert.deepEqual(calls, ["web", "desktop"]);
+  }
+});
+
+test("lyrics fallback never hides expired authentication or retries failed desktop", async () => {
+  for (const code of [301, 500]) {
+    let calls = 0;
+    const { plugin } = await setup(async (url) => {
+      calls++;
+      return response(url.includes("/eapi/") ? { code } : { code: 200, lrc: { lyric: "" } });
+    }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+    await assert.rejects(plugin.lyrics({ id: "1" }), code === 301 ? { code: "signIn" } : /500/);
+    assert.equal(calls, code === 301 ? 1 : 2);
+  }
+});
