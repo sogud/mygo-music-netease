@@ -1,6 +1,6 @@
 # 网易云音乐 · MyGo Music 插件
 
-在 [MyGo Music](https://github.com/egoist/mygo-music) 中搜索和播放网易云音乐。需要 MyGo Music 0.1.20 或更新版本，无需额外服务。
+在 [MyGo Music](https://github.com/egoist/mygo-music) 中搜索和播放网易云音乐。需要 MyGo Music 0.1.21 或更新版本，无需额外服务。
 
 网易云 CDN 封面使用 `{size}` 模板，由主程序按列表、卡片及播放页所需尺寸请求缩略图，减少首次下载和大图解码。0.1.20 之前的主程序不支持此模板，使用前请先升级。
 
