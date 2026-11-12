@@ -768,7 +768,7 @@ async function loadStream(id, quality, generation) {
     throw fail("unavailable", "网易云返回了不支持的音频地址");
   }
   const type = String(audio.type || "mp3").toLowerCase();
-  if (!["mp3", "flac", "ogg"].includes(type)) throw fail("unavailable", "该歌曲的音频格式暂不支持");
+  if (!["mp3", "flac", "ogg", "m4a", "mp4", "aac"].includes(type)) throw fail("unavailable", "该歌曲的音频格式暂不支持");
   return {
     url: url.toString(), type, size: audio.size || 0, bitRate: audio.br || 0,
     quality: ["lossless", "hires"].includes(audio.level) ? "lossless" : audio.level === "standard" ? "standard" : "high",

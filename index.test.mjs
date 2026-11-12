@@ -442,3 +442,13 @@ test("QR account switch rejects old likes and playlists still in flight", async 
     assert.equal((await plugin.account()).id, "9");
   }
 });
+
+test("stream accepts supported AAC containers but still rejects trials", async () => {
+  for(const type of ['m4a','mp4','aac']){
+    const {plugin}=await setup(async()=>response({code:200,data:[{id:1,code:200,url:`https://m1.music.126.net/song.${type}`,type,freeTrialInfo:null}]}));
+    assert.equal((await plugin.stream({id:'1'})).type,type);
+    const {plugin:trial}=await setup(async()=>response({code:200,data:[{id:1,code:200,url:`https://m1.music.126.net/song.${type}`,type,freeTrialInfo:{start:0,end:30}}]}));
+    await assert.rejects(trial.stream({id:'1'}),{code:'unavailable'});
+  }
+});
+

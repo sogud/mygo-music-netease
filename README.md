@@ -1,6 +1,6 @@
 # 网易云音乐 · MyGo Music 插件
 
-在 [MyGo Music](https://github.com/egoist/mygo-music) 中搜索和播放网易云音乐。支持 MyGo Music 0.1.6，无需额外服务。
+在 [MyGo Music](https://github.com/egoist/mygo-music) 中搜索和播放网易云音乐。需要 MyGo Music 0.1.21 或更新版本，无需额外服务。
 
 ## 安装和使用
 
