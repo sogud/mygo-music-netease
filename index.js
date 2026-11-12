@@ -544,6 +544,20 @@ export async function playlist({ id }) {
   return result;
 }
 
+// Some subscription responses ignore offset. Recover via a larger prefix,
+// but only claim completeness when the server explicitly ends the list.
+async function completeShowPrefix(previousSize, limit) {
+  for (;;) {
+    const data = await request("/api/djradio/get/subed", { limit, offset: 0, total: "true" }, { keepSession: true });
+    if (!Array.isArray(data.djRadios)) throw new Error("网易云未返回有效的播客订阅列表");
+    const unique = new Map(data.djRadios.map(item => [String(item.id), { ...toShow(item), subscribed: true }]));
+    if (data.hasMore === false) return [...unique.values()];
+    if (unique.size <= previousSize || limit >= 2000) throw new Error("网易云未返回完整的播客订阅列表，请稍后重试");
+    previousSize = unique.size;
+    limit = Math.min(2000, limit * 2);
+  }
+}
+
 export async function shows() {
   await requireAccount();
   const result = new Map();
@@ -555,10 +569,10 @@ export async function shows() {
     for (const item of items) result.set(String(item.id), { ...toShow(item), subscribed: true });
     if (!data.hasMore) return [...result.values()];
     // A changing subscription list can overlap a page. Advance by the raw
-    // count once, but fail if the server keeps returning the same records.
+    // count once, then recover via a bounded prefix if offset stays stuck.
     duplicatePages = result.size === previousSize ? duplicatePages + 1 : 0;
     if (!items.length || duplicatePages > 1) {
-      throw new Error("网易云未返回完整的播客订阅列表，请稍后重试");
+      return completeShowPrefix(result.size, Math.min(2000, Math.max(200, offset * 2)));
     }
     offset += items.length;
   }

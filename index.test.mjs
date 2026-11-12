@@ -633,7 +633,7 @@ test("podcast pagination advances past one duplicate page but rejects a stalled 
     }, { cookies: { MUSIC_U: 'synthetic-session' }, profile: null });
     if (stalled) {
       await assert.rejects(plugin.shows(), /完整的播客订阅列表/);
-      assert.equal(offsets.length, 3);
+      assert.deepEqual(offsets, [0, 1, 2, 0]);
     } else {
       assert.deepEqual((await plugin.shows()).map(x => x.id), ['1', '2']);
       assert.deepEqual(offsets, [0, 1, 2]);
@@ -793,5 +793,24 @@ test("QR account switch rejects old likes and playlists still in flight", async 
     release();
     await rejected;
     assert.equal((await plugin.account()).id, "9");
+  }
+});
+
+// The live endpoint can accept offset while repeating the same first page.
+test("podcast repeated offsets recover only with a complete bounded prefix", async () => {
+  for (const capped of [false, true]) {
+    const calls=[];
+    const all=Array.from({length:250},(_,i)=>({id:i+1,name:`Show ${i+1}`}));
+    const {plugin}=await setup(async url=>{
+      if(url.includes('account/get'))return response({code:200,profile:{userId:8}});
+      const q=new URL(url).searchParams;
+      const limit=Number(q.get('limit'));calls.push(limit);
+      const items=all.slice(0,capped?100:limit);
+      return response({code:200,djRadios:items,hasMore:items.length<all.length});
+    },{cookies:{MUSIC_U:'synthetic-session'},profile:null});
+    if(capped)await assert.rejects(plugin.shows(),/完整的播客订阅列表/);
+    else assert.deepEqual((await plugin.shows()).map(s=>s.id),all.map(s=>String(s.id)));
+    assert.ok(calls.length<=8);
+    assert.ok(calls.every(limit=>limit<=2000));
   }
 });
