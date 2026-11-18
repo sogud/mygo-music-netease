@@ -4,7 +4,7 @@ from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
 root = Path(__file__).resolve().parent
-manifest = json.loads((root / "plugin.json").read_text())
+manifest = json.loads((root / "plugin.json").read_text(encoding="utf-8"))
 destination = root / "dist" / f"netease-{manifest['version']}.zip"
 destination.parent.mkdir(exist_ok=True)
 with ZipFile(destination, "w", compression=ZIP_DEFLATED) as archive:

@@ -244,12 +244,27 @@ function toAlbum(album = {}) {
 
 function toTrack(track) {
   const privilege = track.privilege;
+  // 宿主没有“这首歌从哪来”的字段，就用歌手行末尾的标签区分：网易云自己
+  // 给不了完整音源（VIP/付费）的歌，或者实际由自定义音源补上的歌，加一个
+  // 「来自音源」；能走网易云流的歌保持原样。
+  const withdrawn = privilege ? privilege.st < 0 : false;
+  const paidOnly = privilege ? privilege.pl <= 0 : track.fee === 1 || track.fee === 4;
+  const artists = (track.ar || track.artists || []).map(toArtist);
+  // 网易云给不了完整音源的歌，歌手后面标「需音源」；实际由音源播过的换成
+  // 「已用音源」。能走网易云流的歌不加任何标记。
+  const served = lxServed.has(String(track.id));
+  if (!withdrawn && (served || paidOnly)) {
+    artists.push({ id: "", name: served ? "已用音源" : "需音源" });
+  }
   return {
     id: String(track.id), name: track.name || "",
-    artists: (track.ar || track.artists || []).map(toArtist),
+    artists,
     album: toAlbum(track.al || track.album), duration: track.dt || track.duration || 0,
     url: `${SITE}/song?id=${track.id}`,
-    unavailable: privilege ? privilege.st < 0 || privilege.pl <= 0 : track.fee === 1 || track.fee === 4,
+    // 宿主会把 unavailable 的歌整行禁用，点了没反应，也就轮不到自定义音源
+    // 去补 VIP 歌。所以只要不是明确下架（st < 0），都让它可点，能不能放
+    // 交给取流去判断。
+    unavailable: withdrawn,
   };
 }
 
@@ -473,6 +488,23 @@ export async function home() {
 }
 
 export async function browse({ page }) {
+  if (page === "sources") return browseSources();
+  if (page === "source-add") {
+    lxListCache = null;
+    const added = lxSyncFromSetting().added;
+    const base = await browseSources();
+    const note = added.length
+      ? `已添加 ${added.length} 个音源：\n${added.map((item) => item.entry).join("\n")}`
+      : "没有新的音源。要再加一个，就在「设置 → 插件 → 网易云音乐 → 自定义音源脚本」里追加一行地址，回来再点一次「添加音源」。";
+    return {
+      ...base,
+      description: `${note}\n\n${base.description}`,
+    };
+  }
+  if (page.startsWith("source:")) {
+    const [, id, action] = page.split(":");
+    return lxSourcePage(id, action);
+  }
   if (/^cloud:\d+$/.test(page)) {
     await requireAccount();
     const offset = pageOffset(Number(page.slice(6)));
@@ -906,7 +938,7 @@ export async function lyrics({ id }) {
   return { lrc: "", translation };
 }
 
-export async function stream({ id, quality = "high" }) {
+async function neteaseStream({ id, quality = "high" }) {
   id = trackIdentity(id).audio;
   if (!id) throw fail("unavailable", "该播客节目没有可播放的音频");
   const generation = epoch;
@@ -920,6 +952,20 @@ export async function stream({ id, quality = "high" }) {
     return result;
   }
   finally { if (pendingStreams.get(key) === pending) pendingStreams.delete(key); }
+}
+
+// NetEase answers first. A custom source of the listener's is asked only when
+// NetEase has no full audio for this track, so its own rights and quality
+// still decide what plays.
+export async function stream({ id, quality = "high" }) {
+  try {
+    return await neteaseStream({ id, quality });
+  } catch (error) {
+    if (error?.code === "signIn" || !lxEnabled()) throw error;
+    const audio = await customStream(id, quality);
+    if (!audio) throw error;
+    return audio;
+  }
 }
 
 async function loadStream(id, quality, generation) {
@@ -1104,4 +1150,782 @@ export async function stationNext({ id }) {
     }
   }
   return (await songDetails(songs.map(song => song.id), songs)).map(toTrack);
+}
+
+// ---------------------------------------------------------------------------
+// 自定义音源：洛雪音乐（LX Music）格式的脚本
+//
+// 脚本按洛雪的自定义源规范运行：开头是 /* @name ... */ 信息块，脚本里用
+// globalThis.lx 的 on/send/request 与应用通信，send(inited, { sources }) 上报
+// 它支持的源。这里只取它的 musicUrl，用来补网易云自己放不了的歌。
+// ---------------------------------------------------------------------------
+
+const LX_SOURCE_KEYS = ["wy", "kw", "kg", "tx", "mg", "local"];
+const LX_INFO_FIELDS = { name: 24, description: 36, author: 56, homepage: 1024, version: 36 };
+const LX_QUALITIES = { standard: "128k", high: "320k", lossless: "flac" };
+const LX_MAX_SCRIPT = 2 << 20;
+const LX_FETCH_TIMEOUT = 15000;
+const lxScriptText = new Map();
+let lxSources = null;
+let lxLoading = null;
+let lxSettingCache = null;
+let lxListCache = null;
+// 这次会话里实际由自定义音源播放过的歌曲 ID，用来在列表里标出来源。
+const lxServed = new Set();
+
+// 音源列表存在插件的私有存储里，这样页面上的添加、启用、删除都能立刻生效；
+// 设置里的「自定义音源脚本」只作为首次导入和批量粘贴的入口。
+function lxStoreList() {
+  if (lxListCache) return lxListCache;
+  lxListCache = lxSyncFromSetting().list;
+  return lxListCache;
+}
+
+// 设置框里的脚本是“待导入”的：每次读列表时并进来，删掉过的不会再回来。
+function lxSyncFromSetting() {
+  let stored;
+  try { stored = host.storage.get("sources"); } catch { stored = undefined; }
+  const list = Array.isArray(stored)
+    ? stored.filter((item) => item && typeof item.entry === "string" && item.entry)
+    : [];
+  const ignored = lxIgnored();
+  const known = new Set(list.map((item) => item.entry));
+  const added = [];
+  for (const entry of lxEntriesFromSetting()) {
+    if (known.has(entry) || ignored.includes(entry)) continue;
+    known.add(entry);
+    added.push({ id: lxID(), entry, enabled: true });
+  }
+  const result = list.concat(added);
+  if (added.length || !Array.isArray(stored)) lxSaveList(result);
+  return { list: result, added };
+}
+
+function lxIgnored() {
+  try {
+    const list = host.storage.get("sourceIgnored");
+    return Array.isArray(list) ? list : [];
+  } catch {
+    return [];
+  }
+}
+
+function lxIgnore(entry) {
+  const list = lxIgnored();
+  if (!list.includes(entry)) {
+    try { host.storage.set("sourceIgnored", list.concat(entry)); } catch { /* 忽略 */ }
+  }
+}
+
+function lxSaveList(list) {
+  lxListCache = list;
+  try { host.storage.set("sources", list); } catch { /* 存不下时至少本进程内有效 */ }
+  lxSources = null;
+  lxLoading = null;
+  lxScriptText.clear();
+}
+
+function lxID() {
+  return Math.random().toString(36).slice(2, 8) + Date.now().toString(36).slice(-3);
+}
+
+function lxSetting() {
+  if (lxSettingCache === null) {
+    let value = "";
+    try { value = String(host.setting("customSource") || ""); } catch { value = ""; }
+    lxSettingCache = value.trim();
+  }
+  return lxSettingCache;
+}
+
+// 地址之间用空白或逗号分开，方便在单行设置框里放多个源。data: 地址里本身
+// 就有逗号和分号，所以它一直读到空白为止；带空格的本地路径用引号包起来。
+function lxParseEntries(text) {
+  const entries = [];
+  let i = 0;
+  while (i < text.length) {
+    while (i < text.length && /[\s,，;；]/.test(text[i])) i++;
+    if (i >= text.length) break;
+    const quote = text[i] === '"' || text[i] === "'" ? text[i] : "";
+    if (quote) {
+      const end = text.indexOf(quote, i + 1);
+      if (end < 0) { entries.push(text.slice(i + 1)); break; }
+      entries.push(text.slice(i + 1, end));
+      i = end + 1;
+      continue;
+    }
+    const inline = /^data:/i.test(text.slice(i, i + 5));
+    let end = i;
+    while (end < text.length && (inline ? !/\s/.test(text[end]) : !/[\s,，;；]/.test(text[end]))) end++;
+    entries.push(text.slice(i, end));
+    i = end;
+  }
+  return entries;
+}
+
+function lxEntriesFromSetting() {
+  return lxParseEntries(lxSetting());
+}
+
+function lxEntries() {
+  return lxStoreList().filter((item) => item.enabled !== false).map((item) => item.entry);
+}
+
+// 本地脚本：Windows 的 C:\…、UNC 的 \\…、以及 macOS/Linux 的 /…。
+function lxIsLocalPath(entry) {
+  return /^[a-z]:[\\/]/i.test(entry) || entry.startsWith("\\\\") || entry.startsWith("/");
+}
+
+function lxEnabled() {
+  return lxEntries().length > 0;
+}
+
+function lxInfoOf(script) {
+  const head = /^\/\*[\s\S]+?\*\//.exec(script);
+  if (!head) throw new Error("不是洛雪自定义音源：开头缺少 /* @name ... */ 信息块");
+  const info = {};
+  for (const line of head[0].split(/\r?\n/)) {
+    const match = /^\s?\*\s?@(\w+)\s+(.+)$/.exec(line);
+    if (!match || !(match[1] in LX_INFO_FIELDS)) continue;
+    info[match[1]] = match[2].trim().slice(0, LX_INFO_FIELDS[match[1]]);
+  }
+  return { name: info.name || "未命名音源", description: info.description || "", version: info.version || "", author: info.author || "", homepage: info.homepage || "" };
+}
+
+const LX_BASE64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+function lxDecodeBase64(text) {
+  const clean = String(text).replace(/[\s=]+$/g, "").replace(/[^A-Za-z0-9+/]/g, "");
+  const out = new Uint8Array(Math.floor((clean.length * 3) / 4));
+  let bits = 0, value = 0, at = 0;
+  for (const char of clean) {
+    value = (value << 6) | LX_BASE64.indexOf(char);
+    bits += 6;
+    if (bits >= 8) { bits -= 8; out[at++] = (value >> bits) & 0xff; }
+  }
+  return out.subarray(0, at);
+}
+
+function lxEncodeBase64(bytes) {
+  let out = "";
+  for (let i = 0; i < bytes.length; i += 3) {
+    const a = bytes[i], b = bytes[i + 1], c = bytes[i + 2];
+    out += LX_BASE64[a >> 2] + LX_BASE64[((a & 3) << 4) | ((b || 0) >> 4)]
+      + (b === undefined ? "=" : LX_BASE64[((b & 15) << 2) | ((c || 0) >> 6)])
+      + (c === undefined ? "=" : LX_BASE64[c & 63]);
+  }
+  return out;
+}
+
+// 宿主沙箱不保证有 TextEncoder/TextDecoder，这里自带一份 UTF-8 编解码。
+function lxText(bytes) {
+  let out = "";
+  for (let i = 0; i < bytes.length;) {
+    const first = bytes[i++];
+    if (first < 0x80) { out += String.fromCharCode(first); continue; }
+    const need = first >= 0xf0 ? 3 : first >= 0xe0 ? 2 : first >= 0xc0 ? 1 : 0;
+    let code = need === 3 ? first & 0x07 : need === 2 ? first & 0x0f : need === 1 ? first & 0x1f : 0xfffd;
+    for (let k = 0; k < need && i < bytes.length; k++) code = (code << 6) | (bytes[i++] & 0x3f);
+    out += code > 0xffff
+      ? String.fromCharCode(0xd800 + ((code - 0x10000) >> 10), 0xdc00 + ((code - 0x10000) & 0x3ff))
+      : String.fromCharCode(code);
+  }
+  return out;
+}
+
+function lxBytes(text) {
+  const out = [];
+  for (const char of String(text)) {
+    let code = char.codePointAt(0);
+    if (code < 0x80) out.push(code);
+    else if (code < 0x800) out.push(0xc0 | (code >> 6), 0x80 | (code & 0x3f));
+    else if (code < 0x10000) out.push(0xe0 | (code >> 12), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
+    else out.push(0xf0 | (code >> 18), 0x80 | ((code >> 12) & 0x3f), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
+  }
+  return Uint8Array.from(out);
+}
+
+// 脚本里 Buffer 的常用操作。Uint8Array 本身没有 toString(format)，所以给
+// 自定义源一个够用的 Buffer 子类，让 lx.utils.buffer.from 的结果能照常使用。
+class LXBuffer extends Uint8Array {
+  toString(format = "utf8") {
+    const name = String(format || "utf8").toLowerCase();
+    if (name === "hex") return Array.from(this, (b) => b.toString(16).padStart(2, "0")).join("");
+    if (name === "base64") return lxEncodeBase64(this);
+    if (name === "binary" || name === "latin1") return String.fromCharCode(...this);
+    return lxText(this);
+  }
+}
+
+function lxBufferFrom(...args) {
+  const [value, encoding] = args;
+  if (value instanceof Uint8Array) return new LXBuffer(value);
+  if (Array.isArray(value)) return new LXBuffer(Uint8Array.from(value));
+  if (value instanceof ArrayBuffer) return new LXBuffer(new Uint8Array(value));
+  const text = String(value ?? "");
+  const name = String(encoding || "utf8").toLowerCase();
+  if (name === "hex") {
+    const out = new Uint8Array(Math.floor(text.length / 2));
+    for (let i = 0; i < out.length; i++) out[i] = parseInt(text.substr(i * 2, 2), 16) || 0;
+    return new LXBuffer(out);
+  }
+  if (name === "base64") return new LXBuffer(lxDecodeBase64(text));
+  if (name === "binary" || name === "latin1") return new LXBuffer(Uint8Array.from(text, (c) => c.charCodeAt(0) & 0xff));
+  return new LXBuffer(lxBytes(text));
+}
+
+// AES：洛雪的 lx.utils.crypto.aesEncrypt 用 Node 的 createCipheriv，很多源
+// 靠它签名。这里按同样的参数形式实现 CBC/ECB/CTR 的加解密。
+function lxAesMul(a, b) {
+  let product = 0;
+  while (b) {
+    if (b & 1) product ^= a;
+    const high = a & 0x80;
+    a = (a << 1) & 0xff;
+    if (high) a ^= 0x1b;
+    b >>= 1;
+  }
+  return product;
+}
+
+const lxAesTables = (() => {
+  const power = (a, n) => {
+    let result = 1;
+    while (n > 0) { if (n & 1) result = lxAesMul(result, a); a = lxAesMul(a, a); n >>= 1; }
+    return result;
+  };
+  const sbox = new Uint8Array(256), inverse = new Uint8Array(256);
+  for (let i = 0; i < 256; i++) {
+    const back = i === 0 ? 0 : power(i, 254);
+    let value = back, rotated = back;
+    for (let k = 0; k < 4; k++) { rotated = ((rotated << 1) | (rotated >> 7)) & 0xff; value ^= rotated; }
+    sbox[i] = value ^ 0x63;
+    inverse[value ^ 0x63] = i;
+  }
+  return { sbox, inverse };
+})();
+
+function lxAesExpand(key) {
+  const nk = key.length / 4, rounds = nk + 6, words = 4 * (rounds + 1);
+  const w = new Uint8Array(words * 4);
+  w.set(key);
+  let rcon = 1;
+  for (let i = nk; i < words; i++) {
+    let t = [w[i * 4 - 4], w[i * 4 - 3], w[i * 4 - 2], w[i * 4 - 1]];
+    if (i % nk === 0) {
+      t = [lxAesTables.sbox[t[1]] ^ rcon, lxAesTables.sbox[t[2]], lxAesTables.sbox[t[3]], lxAesTables.sbox[t[0]]];
+      rcon = lxAesMul(rcon, 2);
+    } else if (nk > 6 && i % nk === 4) {
+      t = t.map((v) => lxAesTables.sbox[v]);
+    }
+    for (let j = 0; j < 4; j++) w[i * 4 + j] = w[(i - nk) * 4 + j] ^ t[j];
+  }
+  return { w, rounds };
+}
+
+function lxAesAddRoundKey(state, w, round) {
+  for (let i = 0; i < 16; i++) state[i] ^= w[round * 16 + i];
+}
+
+function lxAesSub(state, table) {
+  for (let i = 0; i < 16; i++) state[i] = table[state[i]];
+}
+
+// state 按列优先排列：第 r 行第 c 列是 state[r + 4c]。
+function lxAesShift(state, inverse) {
+  const copy = Uint8Array.from(state);
+  for (let r = 0; r < 4; r++) {
+    for (let c = 0; c < 4; c++) {
+      const from = inverse ? (c - r + 4) % 4 : (c + r) % 4;
+      state[r + 4 * c] = copy[r + 4 * from];
+    }
+  }
+}
+
+function lxAesMix(state, inverse) {
+  const matrix = inverse ? [14, 11, 13, 9] : [2, 3, 1, 1];
+  for (let c = 0; c < 4; c++) {
+    const a = state.slice(c * 4, c * 4 + 4);
+    for (let r = 0; r < 4; r++) {
+      let value = 0;
+      for (let k = 0; k < 4; k++) value ^= lxAesMul(a[k], matrix[(k - r + 4) % 4]);
+      state[c * 4 + r] = value;
+    }
+  }
+}
+
+function lxAesBlock(block, expanded, decrypt) {
+  const state = Uint8Array.from(block);
+  const { w, rounds } = expanded;
+  if (!decrypt) {
+    lxAesAddRoundKey(state, w, 0);
+    for (let round = 1; round < rounds; round++) {
+      lxAesSub(state, lxAesTables.sbox);
+      lxAesShift(state, false);
+      lxAesMix(state, false);
+      lxAesAddRoundKey(state, w, round);
+    }
+    lxAesSub(state, lxAesTables.sbox);
+    lxAesShift(state, false);
+    lxAesAddRoundKey(state, w, rounds);
+  } else {
+    lxAesAddRoundKey(state, w, rounds);
+    for (let round = rounds - 1; round > 0; round--) {
+      lxAesShift(state, true);
+      lxAesSub(state, lxAesTables.inverse);
+      lxAesAddRoundKey(state, w, round);
+      lxAesMix(state, true);
+    }
+    lxAesShift(state, true);
+    lxAesSub(state, lxAesTables.inverse);
+    lxAesAddRoundKey(state, w, 0);
+  }
+  return state;
+}
+
+function lxAesCipher(bytes, mode, key, iv, decrypt) {
+  const name = String(mode || "").toLowerCase();
+  const size = /aes-(\d+)/.exec(name)?.[1];
+  if (!size || ![128, 192, 256].includes(Number(size))) throw new Error(`不支持的加密方式：${mode}`);
+  if (![16, 24, 32].includes(key.length)) throw new Error("AES 密钥长度不正确");
+  const expanded = lxAesExpand(key);
+  const block = name.endsWith("-ecb") ? "ecb" : name.endsWith("-ctr") ? "ctr" : name.endsWith("-cbc") ? "cbc" : "";
+  if (!block) throw new Error(`不支持的加密方式：${mode}`);
+  if (block === "ctr") {
+    const out = new Uint8Array(bytes.length);
+    const counter = Uint8Array.from(iv);
+    for (let offset = 0; offset < bytes.length; offset += 16) {
+      const stream = lxAesBlock(counter, expanded, false);
+      for (let i = 0; i < 16 && offset + i < bytes.length; i++) out[offset + i] = bytes[offset + i] ^ stream[i];
+      for (let i = 15; i >= 0; i--) { counter[i] = (counter[i] + 1) & 0xff; if (counter[i] !== 0) break; }
+    }
+    return out;
+  }
+  if (block === "cbc" && (!iv || iv.length !== 16)) throw new Error("AES-CBC 需要 16 字节的 iv");
+  // Node 的 createCipheriv 默认按 PKCS#7 补位，洛雪的脚本按这个语义用。
+  let data = bytes;
+  if (!decrypt) {
+    const pad = 16 - (bytes.length % 16);
+    data = new Uint8Array(bytes.length + pad).fill(pad);
+    data.set(bytes);
+  }
+  const out = new Uint8Array(data.length);
+  let chain = Uint8Array.from(iv || new Uint8Array(16));
+  for (let offset = 0; offset < data.length; offset += 16) {
+    const chunk = data.subarray(offset, offset + 16);
+    if (!decrypt) {
+      const mixed = new Uint8Array(16);
+      for (let i = 0; i < 16; i++) mixed[i] = chunk[i] ^ (block === "cbc" ? chain[i] : 0);
+      const result = lxAesBlock(mixed, expanded, false);
+      out.set(result, offset);
+      chain = result;
+    } else {
+      const result = lxAesBlock(chunk, expanded, true);
+      for (let i = 0; i < 16; i++) out[offset + i] = result[i] ^ (block === "cbc" ? chain[i] : 0);
+      chain = Uint8Array.from(chunk);
+    }
+  }
+  if (!decrypt) return out;
+  const pad = out[out.length - 1];
+  return pad >= 1 && pad <= 16 ? out.subarray(0, out.length - pad) : out;
+}
+
+function lxRandomBytes(size) {
+  const out = new Uint8Array(size);
+  for (let i = 0; i < size; i++) out[i] = Math.floor(Math.random() * 256);
+  return new LXBuffer(out);
+}
+
+// 一个脚本一个运行环境：globalThis 被参数遮住，脚本只能看到自己的 lx。
+// 有的脚本要等一次异步请求拿到 token 才发 inited，所以给一点等待时间。
+function lxRuntime(script, info, wait = 5000) {
+  const handlers = {};
+  let inited = null;
+  let initError = null;
+  let notify = null;
+  const lx = {
+    EVENT_NAMES: { request: "request", inited: "inited", updateAlert: "updateAlert" },
+    version: "2.0.0",
+    env: "desktop",
+    currentScriptInfo: { ...info, rawScript: script },
+    on(name, handler) {
+      if (name !== "request") return Promise.reject(new Error(`不支持的事件：${name}`));
+      handlers.request = handler;
+      return Promise.resolve();
+    },
+    send(name, data) {
+      if (name === "inited") { inited = data || {}; notify?.(); return Promise.resolve(); }
+      return Promise.resolve();
+    },
+    request(url, options, callback) {
+      const settings = options || {};
+      const controller = new AbortController();
+      const wait = Number(settings.timeout) > 0 ? Math.min(Number(settings.timeout), 60000) : 60000;
+      const timer = setTimeout(() => controller.abort(), wait);
+      const headers = { ...(settings.headers || {}) };
+      const init = { method: String(settings.method || "get").toUpperCase(), headers, signal: controller.signal };
+      if (settings.form) {
+        init.body = new URLSearchParams(settings.form).toString();
+        if (!Object.keys(headers).some((key) => key.toLowerCase() === "content-type")) headers["Content-Type"] = "application/x-www-form-urlencoded";
+      } else if (settings.body != null) {
+        init.body = typeof settings.body === "string" ? settings.body : JSON.stringify(settings.body);
+        if (typeof settings.body !== "string" && !Object.keys(headers).some((key) => key.toLowerCase() === "content-type")) headers["Content-Type"] = "application/json";
+      }
+      fetch(url, init).then(async (response) => {
+        const text = typeof response.text === "function" ? await response.text()
+          : typeof response.arrayBuffer === "function" ? lxText(new Uint8Array(await response.arrayBuffer()))
+          : typeof response.json === "function" ? JSON.stringify(await response.json())
+          : "";
+        const raw = lxBytes(text);
+        let body = text;
+        try { body = JSON.parse(text); } catch { /* 不是 JSON 就原样给文本 */ }
+        // 真实 fetch 的 headers 可迭代，测试或别的实现不一定，所以两种都接。
+        let headerFields = {};
+        try { headerFields = Object.fromEntries(response.headers || []); }
+        catch { headerFields = { ...(response.headers || {}) }; }
+        const answer = { statusCode: response.status, statusMessage: response.statusText, headers: headerFields, bytes: raw.length, raw: new LXBuffer(raw), body };
+        callback.call(lx, null, answer, body);
+      }).catch((error) => {
+        callback.call(lx, error, null, null);
+      }).finally(() => clearTimeout(timer));
+      return () => controller.abort();
+    },
+    utils: {
+      crypto: {
+        md5: (text) => host.crypto.md5(String(text)),
+        aesEncrypt: (buffer, mode, key, iv) => new LXBuffer(lxAesCipher(lxBufferFrom(buffer), mode, lxBufferFrom(key), iv == null ? null : lxBufferFrom(iv), false)),
+        randomBytes: lxRandomBytes,
+      },
+      buffer: {
+        from: lxBufferFrom,
+        bufToString: (buf, format) => lxBufferFrom(buf).toString(format),
+      },
+      zlib: {
+        inflate: () => Promise.reject(new Error("当前插件不支持 zlib 解压，请换用不需要压缩的音源")),
+        deflate: () => Promise.reject(new Error("当前插件不支持 zlib 压缩，请换用不需要压缩的音源")),
+      },
+    },
+  };
+  // 不少洛雪脚本直接用全局 Buffer / atob / btoa，这里给一个够用的替身。
+  const Buffer = {
+    from: lxBufferFrom,
+    alloc: (size, fill = 0) => new LXBuffer(new Uint8Array(size).fill(typeof fill === "number" ? fill : 0)),
+    concat: (list) => {
+      const parts = list.map((item) => lxBufferFrom(item));
+      const out = new LXBuffer(parts.reduce((total, part) => total + part.length, 0));
+      let at = 0;
+      for (const part of parts) { out.set(part, at); at += part.length; }
+      return out;
+    },
+    isBuffer: (value) => value instanceof Uint8Array,
+  };
+  const sandbox = {
+    lx, Buffer, console,
+    atob: (text) => lxText(lxDecodeBase64(text)),
+    btoa: (text) => lxEncodeBase64(lxBytes(text)),
+  };
+  try {
+    // 脚本与插件在同一个 realm：把插件的 host（里面有登录 cookie）和其它
+    // 宿主能力挡在参数外，脚本只能用 lx 拿到的东西。用箭头函数包一层，免
+    // 得脚本里的 this 又指回真实全局。
+    const factory = new Function(
+      "globalThis", "window", "self", "host", "fetch", "process", "require", "module", "exports", "global",
+      `"use strict";\nreturn () => {\n${script}\n}`,
+    );
+    factory(sandbox, sandbox, sandbox, undefined, undefined, undefined, undefined, undefined, undefined, sandbox)();
+  } catch (error) {
+    initError = error;
+  }
+  const runtime = {
+    info, script, handlers,
+    get sources() {
+      return inited && inited.sources && typeof inited.sources === "object" ? inited.sources : null;
+    },
+    error: initError,
+    get ready() { return !!runtime.sources && typeof handlers.request === "function"; },
+  };
+  if (runtime.ready || initError) return Promise.resolve(runtime);
+  return new Promise((resolve) => {
+    const done = () => { clearTimeout(timer); notify = null; resolve(runtime); };
+    const timer = setTimeout(done, wait);
+    notify = done;
+  });
+}
+
+// 宿主不给插件读文件，本地脚本只能借 host.spawn 起一个系统命令把文件打印
+// 到标准输出。这需要插件清单里声明 process 权限，并由你在插件设置里点
+// 「允许运行程序」。
+async function lxReadLocal(entry) {
+  const spawn = typeof host !== "undefined" ? host.spawn : null;
+  if (typeof spawn !== "function") {
+    throw new Error("这个版本的 MyGo 不支持读取本地文件，请改用 https:// 地址");
+  }
+  const windows = /^[a-z]:[\\/]/i.test(entry) || entry.startsWith("\\\\");
+  // 用 base64 把字节原样带回来，免得经过控制台的代码页变成乱码。路径里的
+  // 单引号按 PowerShell 的写法转义。
+  const literal = entry.replace(/'/g, "''");
+  const command = windows ? "powershell" : "base64";
+  const args = windows
+    ? ["-NoProfile", "-NonInteractive", "-Command", `[Convert]::ToBase64String([IO.File]::ReadAllBytes('${literal}'))`]
+    : [entry];
+  let child;
+  try {
+    child = spawn(command, args);
+  } catch (error) {
+    throw new Error(`读不了本地音源脚本：${String(error?.message || error)}（需要在插件设置里允许运行程序）`);
+  }
+  let text = "";
+  for (;;) {
+    const line = await child.readLine();
+    if (line === null) break;
+    text += line.trim();
+  }
+  const code = await child.wait();
+  if (code !== 0 || !text.trim()) {
+    const why = String(child.errorOutput?.() || "").trim().slice(0, 120);
+    throw new Error(`读不了本地音源脚本${code ? `（退出码 ${code}）` : ""}${why ? `：${why}` : ""}。若提示权限，请在插件设置里点「允许运行程序」。`);
+  }
+  return lxText(lxDecodeBase64(text));
+}
+
+async function lxReadScript(entry) {
+  if (lxScriptText.has(entry)) return lxScriptText.get(entry);
+  let script;
+  if (/^data:/i.test(entry)) {
+    const match = /^data:([^,]*?),(.*)$/s.exec(entry);
+    if (!match) throw new Error("无法识别的 data: 地址");
+    script = /;base64/i.test(match[1]) ? lxText(lxDecodeBase64(match[2])) : decodeURIComponent(match[2]);
+  } else if (/^https?:\/\//i.test(entry)) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), LX_FETCH_TIMEOUT);
+    try {
+      const response = await fetch(entry, { headers: { "User-Agent": UA }, signal: controller.signal, redirect: "follow" });
+      if (!response.ok) throw new Error(`下载音源脚本失败（HTTP ${response.status}）`);
+      script = await response.text();
+    } catch (error) {
+      if (controller.signal.aborted) throw new Error("下载音源脚本超时，请检查网络后重试");
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  } else if (/^file:\/\//i.test(entry) || lxIsLocalPath(entry)) {
+    script = await lxReadLocal(entry.replace(/^file:\/\//i, "").replace(/^\/([a-z]:)/i, "$1"));
+  } else {
+    throw new Error(`音源地址要填 https:// 链接、data: 内联脚本或本地文件路径：${entry.slice(0, 32)}`);
+  }
+  if (script.length > LX_MAX_SCRIPT) throw new Error("音源脚本过大");
+  lxScriptText.set(entry, script);
+  return script;
+}
+
+async function lxLoad() {
+  const entries = lxEntries();
+  const result = [];
+  for (const entry of entries) {
+    try {
+      const script = await lxReadScript(entry);
+      const info = lxInfoOf(script);
+      const runtime = await lxRuntime(script, info);
+      if (runtime.error) throw runtime.error;
+      if (!runtime.sources) throw new Error("脚本没有发送 inited 事件，可能不是洛雪自定义音源");
+      result.push({ ...runtime, entry });
+    } catch (error) {
+      result.push({ entry, info: { name: entry.replace(/^data:.{0,24}.*/, "内联脚本") }, error, sources: null, ready: false, handlers: {} });
+    }
+  }
+  return result;
+}
+
+async function lxSourcesNow() {
+  if (lxSources) return lxSources;
+  if (!lxLoading) {
+    lxLoading = lxLoad().then((loaded) => { lxSources = loaded; return loaded; })
+      .finally(() => { lxLoading = null; });
+  }
+  return lxLoading;
+}
+
+// 只有脚本声明了「网易云」源、并且它给出了 musicUrl，才可能补这首歌。
+function lxUsable(runtime) {
+  const source = runtime?.sources?.wy;
+  return !!(runtime?.ready && source && Array.isArray(source.actions) && source.actions.includes("musicUrl"));
+}
+
+function lxQualityName(quality) {
+  const source = quality === "lossless" ? "flac" : quality === "standard" ? "128k" : "320k";
+  return source;
+}
+
+// 宿主只把歌曲 ID 交给 stream，脚本却常按名字和歌手再查一次，所以回退时
+// 按 ID 补一次详情。查不到就让脚本只凭 ID 去要。
+async function lxTrackInfo(id) {
+  try {
+    const [song] = await songDetails([id]);
+    if (!song || String(song.id) !== String(id)) return null;
+    return toTrack(song);
+  } catch {
+    return null;
+  }
+}
+
+async function customStream(id, quality) {
+  if (!lxEnabled()) return null;
+  const identity = trackIdentity(id);
+  if (!identity.audio) return null;
+  const loaded = await lxSourcesNow();
+  const runtimes = loaded.filter(lxUsable);
+  if (!runtimes.length) return null;
+  const track = await lxTrackInfo(identity.audio);
+  const wanted = lxQualityName(quality);
+  const failures = [];
+  // 有多个音源时按顺序试，一个拿不到就换下一个，只有全都失败才报错。
+  for (const runtime of runtimes) {
+    const offered = Array.isArray(runtime.sources.wy.qualitys) ? runtime.sources.wy.qualitys : [];
+    const type = offered.includes(wanted) ? wanted : offered.includes("320k") ? "320k" : offered[0] || wanted;
+    // 洛雪的脚本按 musicInfo 里的名字和歌手再查一次，字段要按它的写法给全。
+    const musicInfo = {
+      songmid: identity.audio, id: identity.audio, hash: identity.audio,
+      name: track?.name || "", singer: (track?.artists || []).map((artist) => artist.name).filter(Boolean).join("、"),
+      albumName: track?.album?.name || "", albumId: String(track?.album?.id || ""),
+      interval: track?.duration ? Math.round(track.duration / 1000) : 0,
+      source: "wy", strMediaMid: identity.audio, mediaMid: identity.audio,
+    };
+    let url;
+    try {
+      url = await Promise.resolve(runtime.handlers.request({ source: "wy", action: "musicUrl", info: { type, musicInfo } }));
+    } catch (error) {
+      failures.push(`${runtime.info.name}：${String(error?.message || error).slice(0, 60)}`);
+      continue;
+    }
+    if (typeof url !== "string" || !/^https?:\/\//i.test(url)) {
+      failures.push(`${runtime.info.name}：没有给出音频地址`);
+      continue;
+    }
+    const audio = new URL(url);
+    if (audio.protocol !== "https:") audio.protocol = "https:";
+    const guess = /\.(flac|mp3|m4a|aac|ogg|mp4)(?:$|\?)/i.exec(audio.pathname)?.[1]?.toLowerCase();
+    // 记下来：这首歌这次是从音源播的，列表里要标出来。
+    lxServed.add(identity.audio);
+    return {
+      url: audio.toString(), type: guess || (type === "flac" ? "flac" : "mp3"), size: 0, bitRate: type === "flac" ? 1000 : type === "320k" ? 320 : 128,
+      quality: type === "flac" ? "lossless" : type === "128k" ? "standard" : "high",
+      gain: 0, peak: 0, headers: { "User-Agent": UA },
+    };
+  }
+  throw fail("unavailable", `自定义音源都没有拿到音频：${failures.join("；").slice(0, 200)}`);
+}
+
+export async function browseSources() {
+  const list = lxStoreList();
+  const add = { title: "添加音源", subtitle: "粘贴脚本链接、本地路径或内联脚本", page: "source-add", imageUrl: lxAddCover() };
+  if (!list.length) {
+    return {
+      title: "自定义音源", subtitle: "洛雪音乐（LX Music）格式的音源脚本",
+      description: "还没有音源。点下面的「添加音源」，把脚本的 https:// 链接、本机文件路径（如 C:\\音源.js）"
+        + "或 data: 内联脚本贴进去；要加多个就一行一个。\n"
+        + "网易云自己有完整音源时不会用到它，只有放不了歌时才向它要音频。",
+      sections: [{ title: "还没有添加音源", links: [add] }],
+    };
+  }
+  const loaded = await lxSourcesNow();
+  // 宿主的页面只在页头显示 description，section 只认 title，所以每个脚本的
+  // 详情并到页面描述里。
+  const details = loaded.map((runtime) => {
+    const info = runtime.info || {};
+    if (!runtime.ready) {
+      return `${info.name || "音源"}：没能加载 —— ${String(runtime.error?.message || runtime.error || "脚本没有上报 inited")}`.slice(0, 300);
+    }
+    const list = LX_SOURCE_KEYS.filter((key) => runtime.sources[key]).map((key) => {
+      const names = { wy: "网易云", kw: "酷我", kg: "酷狗", tx: "QQ 音乐", mg: "咪咕", local: "本地" };
+      const qualities = (runtime.sources[key].qualitys || []).join(" / ") || "无";
+      return `${names[key] || key}：${qualities}`;
+    });
+    const version = [info.version && `v${info.version}`, info.author].filter(Boolean).join(" · ");
+    return [
+      `${info.name}${version ? `（${version}）` : ""}`,
+      info.description,
+      list.length ? `支持的源：${list.join("；")}` : "没有声明任何源",
+      lxUsable(runtime) ? "" : "没有「网易云」源，不会用来补网易云的歌。",
+    ].filter(Boolean).join("\n");
+  });
+  return {
+    title: "自定义音源",
+    subtitle: `${loaded.filter(lxUsable).length} / ${loaded.length} 个可用于网易云`,
+    description: details.join("\n\n") + "\n\n点每张卡片可以启用、停用或删除这个音源。",
+    sections: [
+      { title: "音源", links: loaded.map((runtime, index) => lxSourceLink(runtime, list[index])) },
+      { title: "添加", links: [add] },
+    ],
+  };
+}
+
+function lxSourceLink(runtime, item) {
+  const info = runtime?.info || {};
+  const name = info.name || "音源";
+  const on = item?.enabled !== false;
+  const state = on ? (lxUsable(runtime) ? "已启用" : "已启用，但没有网易云源") : "已停用";
+  return {
+    title: name,
+    subtitle: `${state} · 点开可启用、停用或删除`,
+    page: `source:${item?.id || ""}`,
+  };
+}
+
+// 添加卡片的配图：用网易云公开推荐歌单的封面，取不到就留空。
+function lxAddCover() {
+  return discoveryCovers?.[0] || "";
+}
+
+async function lxSourcePage(id, action) {
+  const list = lxStoreList();
+  const before = list.find((one) => one.id === id);
+  if (!before) return browseSources();
+  if (action === "toggle") {
+    lxSaveList(list.map((one) => one.id === id ? { ...one, enabled: one.enabled === false } : one));
+  } else if (action === "delete") {
+    lxIgnore(before.entry);
+    lxSaveList(list.filter((one) => one.id !== id));
+    return browseSources();
+  } else if (action === "retry") {
+    lxSources = null;
+    lxLoading = null;
+    lxScriptText.clear();
+  }
+  // 切换、删除之后要用改过的这一条，不能再用操作前的快照。
+  const item = lxStoreList().find((one) => one.id === id) || before;
+  const loaded = await lxSourcesNow();
+  const runtime = loaded.find((one) => one.entry === item.entry) || { info: {}, ready: false, sources: null };
+  const info = runtime.info || {};
+  const on = item.enabled !== false;
+  const lines = [];
+  if (info.name) lines.push(`${info.name}${info.version ? `（v${info.version}）` : ""}${info.author ? ` · ${info.author}` : ""}`);
+  lines.push(item.entry);
+  if (!on) lines.push("这个音源已停用，不会参与取流。");
+  else if (!runtime.ready) lines.push(`没能加载：${String(runtime.error?.message || "脚本没有上报 inited")}`);
+  else if (!lxUsable(runtime)) lines.push("这个脚本没有「网易云」源，不会用来补网易云的歌。");
+  else lines.push("已启用，网易云放不了歌时会向它要音频。");
+  return {
+    title: info.name || "音源",
+    subtitle: on ? "已启用" : "已停用",
+    description: lines.join("\n"),
+    sections: [{
+      title: "操作",
+      links: [
+        { title: on ? "停用" : "启用", subtitle: on ? "不再用它补歌" : "重新参与补歌", page: `source:${id}:toggle` },
+        { title: "重新加载", subtitle: "改过脚本文件后读一遍", page: `source:${id}:retry` },
+        { title: "删除", subtitle: "从列表里移除这个音源", page: `source:${id}:delete` },
+        { title: "返回列表", subtitle: "查看全部音源", page: "sources" },
+      ],
+    }],
+  };
+}
+
+export function setSetting({ key } = {}) {
+  if (key && key !== "customSource") return;
+  lxSettingCache = null;
+  // 设置框里的新脚本要能立刻并进列表，所以列表缓存也要作废。
+  lxListCache = null;
+  lxSources = null;
+  lxLoading = null;
+  lxScriptText.clear();
 }

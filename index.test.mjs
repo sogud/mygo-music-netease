@@ -140,7 +140,8 @@ test("search preserves order, pages, and uses the account's detail privileges", 
     return response({ code: 200, songs: [song(2), song(1)], privileges: [{ id: 1, st: 0, pl: 320000 }, { id: 2, st: 0, pl: 0 }] });
   });
   const result = await plugin.search({ query: "song", offset: 30 });
-  assert.deepEqual(result.tracks.map((t) => [t.id, t.unavailable]), [["1", false], ["2", true]]);
+  // 只有明确下架的才标不可用；VIP 无播放权限仍可点，交给自定义音源去补。
+  assert.deepEqual(result.tracks.map((t) => [t.id, t.unavailable]), [["1", false], ["2", false]]);
   assert.equal(result.more, true);
 });
 
@@ -865,4 +866,406 @@ test("eapi requests pair the desktop User-Agent with the PC payload and host", a
   assert.ok(seenHeaders["User-Agent"].includes("Windows NT 10.0"));
   assert.ok(seenHeaders["User-Agent"].includes(`NeteaseMusicDesktop/${seenPayload.data.header.appver}`));
   assert.ok(!seenHeaders["User-Agent"].includes("iPhone"));
+});
+
+// ---- 自定义音源（洛雪音乐格式）---------------------------------------------
+
+const lxScript = (body, meta = "@name 测试音源\n * @version 1.0.0\n * @author fixture") => `/**\n * ${meta}\n */\n${body}`;
+const lxInline = (script) => `data:text/javascript;base64,${Buffer.from(script).toString("base64")}`;
+const lxInit = `send(EVENT_NAMES.inited, { openDevTools: false, sources: {
+  wy: { name: "网易云", type: "music", actions: ["musicUrl"], qualitys: ["128k", "320k", "flac"] },
+} })`;
+const noAudio = () => response({ code: 200, data: [] });
+
+async function setupWithSource(setting, handler) {
+  const storage = new Map();
+  globalThis.host = {
+    storage: { get: (k) => storage.get(k), set: (k, v) => storage.set(k, structuredClone(v)), remove: (k) => storage.delete(k) },
+    crypto: {
+      md5: (text) => createHash("md5").update(text).digest("hex"),
+      aesEcbEncrypt: (key, text) => {
+        const c = createCipheriv("aes-128-ecb", key, null);
+        return Buffer.concat([c.update(text, "utf8"), c.final()]).toString("hex");
+      },
+    },
+    setting: (key) => (key === "customSource" ? setting : ""),
+    signInPrompt: () => {},
+  };
+  globalThis.fetch = handler;
+  const plugin = await import(`./index.js?test=${++sequence}`);
+  return { plugin, storage };
+}
+
+// 网易云没给完整音源时，用洛雪脚本的 musicUrl 补上，并保留脚本给的地址。
+test("custom source fills in audio NetEase will not give", async () => {
+  const script = lxScript(`const { EVENT_NAMES, on, send } = globalThis.lx
+on(EVENT_NAMES.request, ({ source, action, info }) => {
+  if (source !== "wy" || action !== "musicUrl") return Promise.reject(new Error("no"))
+  return Promise.resolve("https://cdn.example/" + info.musicInfo.songmid + ".flac")
+})
+${lxInit}`);
+  const { plugin } = await setupWithSource(lxInline(script), noAudio);
+  const audio = await plugin.stream({ id: "12345", quality: "lossless" });
+  assert.equal(audio.type, "flac");
+  assert.equal(audio.quality, "lossless");
+  assert.equal(audio.url, "https://cdn.example/12345.flac");
+});
+
+// 网易云自己给得出音源时，不去碰自定义源。
+test("NetEase audio wins and the custom source is never asked", async () => {
+  const script = lxScript(`const { EVENT_NAMES, on, send } = globalThis.lx
+on(EVENT_NAMES.request, () => Promise.resolve("https://cdn.example/no.flac"))
+${lxInit}`);
+  const { plugin } = await setupWithSource(lxInline(script), async () => response({
+    code: 200, data: [{ id: 1, code: 200, url: "https://m1.music.126.net/song.mp3", type: "mp3", level: "exhigh" }],
+  }));
+  const audio = await plugin.stream({ id: "1" });
+  assert.match(audio.url, /music\.126\.net/);
+});
+
+// 脚本没声明 wy 源、或返回的地址不是 http(s) 时，保留网易云原来的错误。
+test("a custom source that cannot serve this track leaves the NetEase error", async () => {
+  const noWy = lxScript(`const { EVENT_NAMES, on, send } = globalThis.lx
+on(EVENT_NAMES.request, () => Promise.resolve("https://cdn.example/x.flac"))
+send(EVENT_NAMES.inited, { sources: { kw: { name: "酷我", type: "music", actions: ["musicUrl"], qualitys: ["flac"] } } })`);
+  const { plugin } = await setupWithSource(lxInline(noWy), noAudio);
+  await assert.rejects(plugin.stream({ id: "1" }), { code: "unavailable" });
+
+  const badURL = lxScript(`const { EVENT_NAMES, on, send } = globalThis.lx
+on(EVENT_NAMES.request, () => Promise.resolve("file:///etc/passwd"))
+${lxInit}`);
+  const second = await setupWithSource(lxInline(badURL), noAudio);
+  await assert.rejects(second.plugin.stream({ id: "1" }), { code: "unavailable" });
+});
+
+// 登录失效不能被自定义源掩盖：那是账号问题，不是这首歌放不了。
+test("sign-in failures are not covered up by a custom source", async () => {
+  const script = lxScript(`const { EVENT_NAMES, on, send } = globalThis.lx
+on(EVENT_NAMES.request, () => Promise.resolve("https://cdn.example/x.flac"))
+${lxInit}`);
+  const { plugin } = await setupWithSource(lxInline(script), async () => response({ code: 301 }));
+  await assert.rejects(plugin.stream({ id: "1" }), { code: "signIn" });
+});
+
+// 脚本里用到的洛雪工具要真的可用：md5、AES（对齐 Node 的 createCipheriv）、
+// Buffer 子集，以及 lx.request 的回调形状。
+test("the custom source runtime provides lx utils and request", async () => {
+  const script = lxScript(`const { EVENT_NAMES, on, send } = globalThis.lx
+const key = globalThis.lx.utils.buffer.from("0123456789abcdef")
+const iv = globalThis.lx.utils.buffer.from("abcdef0123456789")
+const encrypted = globalThis.lx.utils.crypto.aesEncrypt("hello", "aes-128-cbc", key, iv)
+const hex = globalThis.lx.utils.buffer.bufToString(encrypted, "hex")
+const digest = globalThis.lx.utils.crypto.md5("fixture")
+on(EVENT_NAMES.request, () => new Promise((resolve, reject) => {
+  globalThis.lx.request("https://api.example/song", { method: "POST", form: { id: "9" } }, (err, resp) => {
+    if (err) return reject(err)
+    resolve("https://cdn.example/" + resp.body.url + "?hex=" + hex.slice(0, 8) + "&md5=" + digest.slice(0, 8))
+  })
+}))
+${lxInit}`);
+  const cipher = createCipheriv("aes-128-cbc", Buffer.from("0123456789abcdef"), Buffer.from("abcdef0123456789"));
+  const hex = Buffer.concat([cipher.update("hello"), cipher.final()]).toString("hex");
+  const md5 = createHash("md5").update("fixture").digest("hex");
+  const { plugin } = await setupWithSource(lxInline(script), async (url) => {
+    if (url === "https://api.example/song") return response({ url: "song.flac" });
+    return noAudio();
+  });
+  const audio = await plugin.stream({ id: "7" });
+  assert.equal(audio.url, `https://cdn.example/song.flac?hex=${hex.slice(0, 8)}&md5=${md5.slice(0, 8)}`);
+});
+
+// 页面列出每个脚本的加载结果，空设置时给出填写指引。
+test("the custom source page reports what each script offers", async () => {
+  const script = lxScript(`const { EVENT_NAMES, on, send } = globalThis.lx
+on(EVENT_NAMES.request, () => Promise.resolve("https://cdn.example/x.flac"))
+${lxInit}`);
+  const { plugin } = await setupWithSource(lxInline(script), noAudio);
+  const page = await plugin.browseSources();
+  assert.match(page.subtitle, /1 \/ 1/);
+  assert.equal(page.sections[0].title, "音源");
+  assert.equal(page.sections[0].links[0].title, "测试音源");
+  assert.equal(page.sections[1].links[0].page, "source-add");
+  assert.match(page.description, /网易云：128k \/ 320k \/ flac/);
+
+  const empty = await setupWithSource("", noAudio);
+  const blank = await empty.plugin.browseSources();
+  assert.match(blank.description, /添加音源/);
+});
+
+// 设置里新加的脚本会并入列表；多个音源时按顺序试，前一个失败才用后一个。
+test("new scripts from the setting join the list and sources are tried in order", async () => {
+  const first = lxScript(`const { EVENT_NAMES, on, send } = globalThis.lx
+on(EVENT_NAMES.request, () => Promise.reject(new Error("第一个失败")))
+${lxInit}`);
+  const second = lxScript(`const { EVENT_NAMES, on, send } = globalThis.lx
+on(EVENT_NAMES.request, () => Promise.resolve("https://cdn.example/second.flac"))
+${lxInit}`, "@name 第二个音源");
+  let setting = lxInline(first);
+  const storage = new Map();
+  globalThis.host = {
+    storage: { get: (k) => storage.get(k), set: (k, v) => storage.set(k, structuredClone(v)), remove: (k) => storage.delete(k) },
+    crypto: { md5: () => "0".repeat(32), aesEcbEncrypt: () => "" },
+    setting: (key) => (key === "customSource" ? setting : ""),
+    signInPrompt: () => {},
+  };
+  globalThis.fetch = noAudio;
+  const plugin = await import(`./index.js?test=${++sequence}`);
+  await assert.rejects(plugin.stream({ id: "1" }), { code: "unavailable" });
+  setting = `${lxInline(first)} ${lxInline(second)}`;
+  plugin.setSetting({ key: "customSource" });
+  assert.match((await plugin.stream({ id: "1" })).url, /second/);
+  const page = await plugin.browseSources();
+  assert.equal(page.sections[0].links.length, 2);
+});
+
+// 添加按钮把设置里的脚本导进来，已经在列表里的不重复添加。
+test("the add button imports the setting and skips what is already listed", async () => {
+  const script = lxScript(`const { EVENT_NAMES, on, send } = globalThis.lx
+on(EVENT_NAMES.request, () => Promise.resolve("https://cdn.example/x.flac"))
+${lxInit}`);
+  const storage = new Map();
+  globalThis.host = {
+    storage: { get: (k) => storage.get(k), set: (k, v) => storage.set(k, structuredClone(v)), remove: (k) => storage.delete(k) },
+    crypto: { md5: () => "0".repeat(32), aesEcbEncrypt: () => "" },
+    setting: (key) => (key === "customSource" ? lxInline(script) : ""),
+    signInPrompt: () => {},
+  };
+  globalThis.fetch = noAudio;
+  const plugin = await import(`./index.js?test=${++sequence}`);
+  const added = await plugin.browse({ page: "source-add" });
+  assert.match(added.description, /已添加 1 个/);
+  const again = await plugin.browse({ page: "source-add" });
+  assert.match(again.description, /没有新的音源/);
+  assert.equal((await plugin.browseSources()).sections[0].links.length, 1);
+});
+
+// 每个音源都能单独停用和删除，删除后不会被设置重新带回来。
+test("a source can be disabled and deleted without coming back", async () => {
+  const script = lxScript(`const { EVENT_NAMES, on, send } = globalThis.lx
+on(EVENT_NAMES.request, () => Promise.resolve("https://cdn.example/x.flac"))
+${lxInit}`);
+  const storage = new Map();
+  globalThis.host = {
+    storage: { get: (k) => storage.get(k), set: (k, v) => storage.set(k, structuredClone(v)), remove: (k) => storage.delete(k) },
+    crypto: { md5: () => "0".repeat(32), aesEcbEncrypt: () => "" },
+    setting: (key) => (key === "customSource" ? lxInline(script) : ""),
+    signInPrompt: () => {},
+  };
+  globalThis.fetch = noAudio;
+  const plugin = await import(`./index.js?test=${++sequence}`);
+  const page = await plugin.browseSources();
+  const id = page.sections[0].links[0].page.split(":")[1];
+  const off = await plugin.browse({ page: `source:${id}:toggle` });
+  assert.equal(off.subtitle, "已停用");
+  await assert.rejects(plugin.stream({ id: "1" }), { code: "unavailable" });
+  await plugin.browse({ page: `source:${id}:toggle` });
+  assert.match((await plugin.stream({ id: "1" })).url, /x\.flac/);
+  await plugin.browse({ page: `source:${id}:delete` });
+  const after = await plugin.browseSources();
+  assert.equal(after.sections[0].title, "还没有添加音源");
+  assert.equal(after.sections[0].links[0].page, "source-add");
+});
+
+
+// 洛雪官方文档里的示例脚本写法（lx.request + resp.body），验证真实脚本能跑。
+test("a script written the way the LX docs show can serve a track", async () => {
+  const script = lxScript(`const { EVENT_NAMES, request, on, send } = globalThis.lx
+const qualitys = { wy: { "128k": "128", "320k": "320", flac: "flac" } }
+const httpRequest = (url, options) => new Promise((resolve, reject) => {
+  request(url, options, (err, resp) => {
+    if (err) return reject(err)
+    resolve(resp.body)
+  })
+})
+const apis = {
+  wy: {
+    musicUrl({ songmid }, quality) {
+      return httpRequest("https://api.example/wy?id=" + songmid + "&quality=" + quality).then((data) => data.url)
+    },
+  },
+}
+on(EVENT_NAMES.request, ({ source, action, info }) => {
+  if (action !== "musicUrl") return Promise.reject(new Error("unsupported"))
+  return apis[source].musicUrl(info.musicInfo, qualitys[source][info.type])
+})
+${lxInit}`);
+  const asked = [];
+  const { plugin } = await setupWithSource(lxInline(script), async (url) => {
+    asked.push(String(url));
+    if (String(url).startsWith("https://api.example/wy")) return response({ url: "https://cdn.example/wy.flac" });
+    return noAudio();
+  });
+  const audio = await plugin.stream({ id: "99", quality: "high" });
+  assert.equal(audio.url, "https://cdn.example/wy.flac");
+  assert.ok(asked.includes("https://api.example/wy?id=99&quality=320"));
+});
+
+// 脚本等一次异步请求拿到凭据后才发 inited，运行时要等它。
+test("a script that reports its sources after an await is still loaded", async () => {
+  const script = lxScript(`const { EVENT_NAMES, request, on, send } = globalThis.lx
+on(EVENT_NAMES.request, () => Promise.resolve("https://cdn.example/late.flac"))
+request("https://api.example/token", { method: "GET" }, (err, resp) => {
+  send(EVENT_NAMES.inited, { sources: { wy: { type: "music", actions: ["musicUrl"], qualitys: ["flac"] } } })
+})`);
+  const { plugin } = await setupWithSource(lxInline(script), async (url) => {
+    if (String(url).startsWith("https://api.example/token")) return response({ token: "t" });
+    return noAudio();
+  });
+  const audio = await plugin.stream({ id: "5" });
+  assert.equal(audio.url, "https://cdn.example/late.flac");
+});
+
+
+// 脚本按歌名和歌手再查一次时，要拿到真实的歌曲信息。
+test("the custom source receives the track's name and artists", async () => {
+  const script = lxScript(`const { EVENT_NAMES, on, send } = globalThis.lx
+on(EVENT_NAMES.request, ({ info }) => {
+  const m = info.musicInfo
+  return Promise.resolve("https://cdn.example/" + encodeURIComponent(m.name + "|" + m.singer + "|" + m.interval) + ".mp3")
+})
+${lxInit}`);
+  const { plugin } = await setupWithSource(lxInline(script), async (url, init) => {
+    if (String(url).includes("song/detail")) {
+      return response({ code: 200, songs: [{ id: 42, name: "夜曲", ar: [{ id: 1, name: "周杰伦" }, { id: 2, name: "方文山" }], al: { id: 3, name: "十一月的萧邦" }, dt: 226000 }], privileges: [] });
+    }
+    return noAudio();
+  });
+  const audio = await plugin.stream({ id: "42" });
+  assert.equal(decodeURIComponent(new URL(audio.url).pathname.slice(1, -4)), "夜曲|周杰伦、方文山|226");
+});
+
+// 脚本与插件同处一个 realm，但拿不到插件的 host（那里面有登录 cookie）。
+test("a custom source cannot reach the plugin's host or fetch", async () => {
+  const script = lxScript(`const { EVENT_NAMES, on, send } = globalThis.lx
+on(EVENT_NAMES.request, () => Promise.resolve(
+  "https://cdn.example/" + [typeof host, typeof fetch, typeof require, typeof process].join("-") + ".mp3"
+))
+${lxInit}`);
+  const { plugin } = await setupWithSource(lxInline(script), noAudio);
+  const audio = await plugin.stream({ id: "1" });
+  assert.equal(new URL(audio.url).pathname, "/undefined-undefined-undefined-undefined.mp3");
+});
+
+// 本地文件路径要能直接填，路径里的空格用引号包住。
+test("a local script path is read through host.spawn and can serve audio", async () => {
+  const script = lxScript(`const { EVENT_NAMES, on, send } = globalThis.lx
+on(EVENT_NAMES.request, () => Promise.resolve("https://cdn.example/local.flac"))
+${lxInit}`);
+  const base64 = Buffer.from(script, "utf8").toString("base64");
+  const calls = [];
+  globalThis.host = {
+    storage: { get: () => undefined, set: () => {}, remove: () => {} },
+    crypto: { md5: (t) => createHash("md5").update(t).digest("hex"), aesEcbEncrypt: () => "" },
+    setting: (k) => (k === "customSource" ? '"D:\\Music Sources\\my source.js"' : ""),
+    signInPrompt: () => {},
+    spawn: (command, args) => {
+      calls.push([command, args]);
+      const lines = [base64.slice(0, 40), base64.slice(40)];
+      return {
+        errorOutput: () => "",
+        readLine: async () => (lines.length ? lines.shift() : null),
+        wait: async () => 0,
+      };
+    },
+  };
+  globalThis.fetch = noAudio;
+  const plugin = await import(`./index.js?test=${++sequence}`);
+  const audio = await plugin.stream({ id: "1" });
+  assert.equal(audio.url, "https://cdn.example/local.flac");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0], "powershell");
+  assert.ok(calls[0][1].at(-1).includes("Music Sources"));
+});
+
+// 没有「允许运行程序」时给出可执行的提示，而不是静默失败。
+test("a local script without program permission explains what to do", async () => {
+  globalThis.host = {
+    storage: { get: () => undefined, set: () => {}, remove: () => {} },
+    crypto: { md5: () => "0".repeat(32), aesEcbEncrypt: () => "" },
+    setting: (k) => (k === "customSource" ? "C:\\Music\\source.js" : ""),
+    signInPrompt: () => {},
+    spawn: () => { throw new Error("the listener hasn't allowed this plugin to start programs"); },
+  };
+  globalThis.fetch = noAudio;
+  const plugin = await import(`./index.js?test=${++sequence}`);
+  const page = await plugin.browseSources();
+  assert.match(page.description, /允许运行程序/);
+  await assert.rejects(plugin.stream({ id: "1" }), { code: "unavailable" });
+});
+
+// 多个地址混填：链接、data: 和本地路径都要认得出来。
+test("the setting accepts links, inline data and local paths together", async () => {
+  const inline = lxInline(lxScript(`const { EVENT_NAMES, on, send } = globalThis.lx
+on(EVENT_NAMES.request, () => Promise.resolve("https://cdn.example/x.flac"))
+${lxInit}`));
+  globalThis.host = {
+    storage: { get: () => undefined, set: () => {}, remove: () => {} },
+    crypto: { md5: () => "0".repeat(32), aesEcbEncrypt: () => "" },
+    setting: (k) => (k === "customSource" ? `  ${inline}   "C:\\a b\\c.js"  ` : ""),
+    signInPrompt: () => {},
+    spawn: () => ({
+      errorOutput: () => "",
+      readLine: async () => null,
+      wait: async () => 1,
+    }),
+  };
+  globalThis.fetch = noAudio;
+  const plugin = await import(`./index.js?test=${++sequence}`);
+  const page = await plugin.browseSources();
+  assert.match(page.subtitle, /1 \/ 2/);
+  assert.match(page.description, /C:\\\\a b\\\\c\.js|读不了本地音源脚本/);
+});
+
+// VIP 歌在网易云拿不到完整音源时，只要脚本能补上，就必须可点并真的放出来。
+test("a VIP-only track stays clickable and is served by the custom source", async () => {
+  const script = lxScript(`const { EVENT_NAMES, on, send } = globalThis.lx
+on(EVENT_NAMES.request, ({ info }) => Promise.resolve("https://cdn.example/" + info.musicInfo.songmid + ".flac"))
+${lxInit}`);
+  const { plugin } = await setupWithSource(lxInline(script), async (url, init) => {
+    if (String(url).includes("cloudsearch")) return response({ code: 200, result: { songs: [song(1)], songCount: 1 } });
+    if (String(url).includes("song/detail")) {
+      return response({ code: 200, songs: [song(1)], privileges: [{ id: 1, st: 0, pl: 0 }] });
+    }
+    return noAudio();
+  });
+  const result = await plugin.search({ query: "vip" });
+  assert.equal(result.tracks[0].unavailable, false);
+  const audio = await plugin.stream({ id: result.tracks[0].id, quality: "lossless" });
+  assert.equal(audio.type, "flac");
+});
+
+// 明确下架的歌仍然标不可用，宿主会把它置灰。
+test("a withdrawn track is still marked unavailable", async () => {
+  const { plugin } = await setup(async (url, init) => {
+    if (String(url).includes("cloudsearch")) return response({ code: 200, result: { songs: [song(9)], songCount: 1 } });
+    return response({ code: 200, songs: [song(9)], privileges: [{ id: 9, st: -200, pl: 0 }] });
+  });
+  const result = await plugin.search({ query: "gone" });
+  assert.equal(result.tracks[0].unavailable, true);
+});
+
+// 列表里要能看出哪些歌要靠音源：无播放权限的标「来自音源」，能走网易云流的不标。
+test("tracks that need a custom source are marked in the artist line", async () => {
+  const script = lxScript(`const { EVENT_NAMES, on, send } = globalThis.lx
+on(EVENT_NAMES.request, ({ info }) => Promise.resolve("https://cdn.example/" + info.musicInfo.songmid + ".flac"))
+${lxInit}`);
+  const { plugin } = await setupWithSource(lxInline(script), async (url, init) => {
+    if (String(url).includes("cloudsearch")) {
+      return response({ code: 200, result: { songs: [song(1), song(2), song(3)], songCount: 3 } });
+    }
+    if (String(url).includes("song/detail")) {
+      return response({ code: 200, songs: [song(1), song(2), song(3)], privileges: [
+        { id: 1, st: 0, pl: 320000 },
+        { id: 2, st: 0, pl: 0 },
+        { id: 3, st: -200, pl: 0 },
+      ] });
+    }
+    return noAudio();
+  });
+  const result = await plugin.search({ query: "mix" });
+  const names = result.tracks.map((t) => t.artists.map((a) => a.name).join("/"));
+  assert.equal(names[0], "Artist", "网易云能放的歌不加标记");
+  assert.match(names[1], /需音源$/, "VIP 歌标出来源");
+  assert.doesNotMatch(names[2], /需音源/, "下架的歌不标");
+  assert.equal(result.tracks[2].unavailable, true);
 });
