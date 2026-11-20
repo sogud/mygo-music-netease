@@ -641,6 +641,34 @@ export async function artist({ id }) {
   };
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// NetEase answers like writes and liked-list reads with -460 risk control, or
+// 405 when asked too often; retrying with backoff turns a refusal into a retry
+// instead of a like the listener thinks was saved.
+function refused(error) {
+  if (!error) return false;
+  if (error.neteaseCode === 460 || error.neteaseCode === -460) return true;
+  return /操作频繁|限制了请求|超时/.test(String(error.message || ""));
+}
+
+async function retrying(run, hint) {
+  let lastError = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      return await run();
+    } catch (error) {
+      lastError = error;
+      if (attempt === 2 || !refused(error)) break;
+      await sleep(700 * (attempt + 1) * (attempt + 1));
+    }
+  }
+  if (hint && refused(lastError)) throw new Error(hint);
+  throw lastError;
+}
+
 async function likedIDs() {
   const activeSession = currentSession();
   const generation = epoch;
@@ -648,7 +676,7 @@ async function likedIDs() {
   checkAccountSession(activeSession, generation);
   if (likedCache && likedCache.uid === profile.id && Date.now() - likedCache.at < 60000) return likedCache.ids;
   const revision = likedRevision;
-  const data = await eapi("/api/song/like/get", { uid: profile.id }, { session: activeSession, keepSession: true });
+  const data = await retrying(() => eapi("/api/song/like/get", { uid: profile.id }, { session: activeSession, keepSession: true }));
   checkAccountSession(activeSession, generation);
   if (revision !== likedRevision) throw new Error("喜欢状态已更新，请重试");
   const ids = (data.ids || []).map(String);
@@ -683,9 +711,9 @@ export async function like({ id, on }) {
   const generation = epoch;
   await requireAccount();
   checkAccountSession(activeSession, generation);
-  await eapi("/api/radio/like", { alg: "itembased", trackId: identity.audio, like: String(!!on), time: "3" }, {
+  await retrying(() => eapi("/api/radio/like", { alg: "itembased", trackId: identity.audio, like: String(!!on), time: "3" }, {
     session: activeSession, keepSession: true,
-  });
+  }), "网易云拒绝了这次操作（风控或操作频繁），请等约 30 秒后再点红心");
   checkAccountSession(activeSession, generation);
   likedRevision++;
   likedCache = null;
