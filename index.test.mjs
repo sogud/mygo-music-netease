@@ -866,3 +866,69 @@ test("eapi requests pair the desktop User-Agent with the PC payload and host", a
   assert.ok(seenHeaders["User-Agent"].includes(`NeteaseMusicDesktop/${seenPayload.data.header.appver}`));
   assert.ok(!seenHeaders["User-Agent"].includes("iPhone"));
 });
+
+test("playlist and liked tracks include addedAt, release date fallback, and best-effort playCount", async () => {
+  const { plugin } = await setup(async (url, init) => {
+    if (url.includes("account/get")) return response({ code: 200, profile: { userId: 8, nickname: "Fixture" } });
+    if (url.includes("/api/v1/play/record")) {
+      return response({ code: 200, allData: [{ song: { id: 1 }, playCount: 42 }] });
+    }
+    if (url.includes("playlist/detail")) {
+      return response({
+        code: 200,
+        playlist: {
+          id: 9,
+          name: "List",
+          trackCount: 2,
+          trackIds: [{ id: 1, at: 1700000000000 }, { id: 2, at: 1700100000000 }],
+        },
+      });
+    }
+    const { path } = decode(init.body);
+    if (path === "/api/song/like/get") return response({ code: 200, ids: [1, 2] });
+    assert.equal(path, "/api/v3/song/detail");
+    return response({
+      code: 200,
+      songs: [
+        { ...song(1), al: { id: 6, name: "Album 1", publishTime: 0 }, publishTime: 1700064000000 },
+        { ...song(2), al: { id: 7, name: "Album 2", publishTime: 1609430400000 }, publishTime: 1700064000000 },
+      ],
+      privileges: [],
+    });
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+
+  const pl = await plugin.playlist({ id: "9" });
+  assert.deepEqual(
+    pl.tracks.map((t) => [t.id, t.addedAt, t.playCount, t.album.released]),
+    [
+      ["1", 1700000000000, 42, "2023-11-16"],
+      ["2", 1700100000000, 0, "2021-01-01"],
+    ],
+  );
+
+  const lk = await plugin.liked({ offset: 0 });
+  assert.deepEqual(lk.tracks.map((t) => [t.id, t.playCount]), [["1", 42], ["2", 0]]);
+});
+
+test("playlist and liked degrade gracefully when play record fails", async () => {
+  const { plugin } = await setup(async (url, init) => {
+    if (url.includes("account/get")) return response({ code: 200, profile: { userId: 8, nickname: "Fixture" } });
+    if (url.includes("/api/v1/play/record")) return response({ code: 500 });
+    if (url.includes("playlist/detail")) {
+      return response({
+        code: 200,
+        playlist: { id: 9, name: "List", trackCount: 1, trackIds: [{ id: 1, at: 1700000000000 }] },
+      });
+    }
+    const { path } = decode(init.body);
+    if (path === "/api/song/like/get") return response({ code: 200, ids: [1] });
+    return response({ code: 200, songs: [song(1)], privileges: [] });
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+
+  const pl = await plugin.playlist({ id: "9" });
+  assert.equal(pl.tracks[0].addedAt, 1700000000000);
+  assert.equal(pl.tracks[0].playCount, 0);
+
+  const lk = await plugin.liked({ offset: 0 });
+  assert.equal(lk.tracks[0].playCount, 0);
+});
