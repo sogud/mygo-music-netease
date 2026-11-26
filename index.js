@@ -31,6 +31,7 @@ let epoch = 0;
 let profileCheckedAt = 0;
 let likedCache = null;
 let likedRevision = 0;
+let playCountCache = null;
 const pendingStreams = new Map();
 let discoveryCovers = null;
 let heartState = null;
@@ -124,6 +125,7 @@ function clearSession() {
   session = { cookies: {}, profile: null };
   profileCheckedAt = 0;
   likedCache = null;
+  playCountCache = null;
   pendingStreams.clear();
   heartState = null;
   pendingHeart = null;
@@ -233,12 +235,16 @@ function toArtist(artist = {}) {
   return { id: String(artist.id || ""), name: artist.name || "", imageUrl: artworkURL(artist.img1v1Url || artist.picUrl) };
 }
 
-function toAlbum(album = {}) {
-  const date = Number(album.publishTime);
+function formatReleaseDate(ms) {
+  const n = Number(ms);
+  return n > 0 ? new Date(n + 8 * 3600 * 1000).toISOString().slice(0, 10) : "";
+}
+
+function toAlbum(album = {}, fallbackPublishTime = 0) {
   return {
     id: String(album.id || ""), name: album.name || "", imageUrl: artworkURL(album.picUrl),
     artists: (album.artists || (album.artist ? [album.artist] : [])).map(toArtist),
-    released: date > 0 ? new Date(date).toISOString().slice(0, 10) : "",
+    released: formatReleaseDate(Number(album.publishTime) || Number(fallbackPublishTime) || 0),
   };
 }
 
@@ -247,7 +253,7 @@ function toTrack(track) {
   return {
     id: String(track.id), name: track.name || "",
     artists: (track.ar || track.artists || []).map(toArtist),
-    album: toAlbum(track.al || track.album), duration: track.dt || track.duration || 0,
+    album: toAlbum(track.al || track.album, track.publishTime), duration: track.dt || track.duration || 0,
     url: `${SITE}/song?id=${track.id}`,
     unavailable: privilege ? privilege.st < 0 || privilege.pl <= 0 : track.fee === 1 || track.fee === 4,
   };
@@ -394,6 +400,7 @@ export async function signIn() {
       pendingHeart = null;
       profileCheckedAt = Date.now();
       likedCache = null;
+      playCountCache = null;
       persistSession();
       host.signInPrompt({ text: "登录成功" });
       return pending.profile;
@@ -542,13 +549,48 @@ export async function playlists() {
   }
 }
 
+async function loadAllPlayCounts() {
+  try {
+    const activeSession = currentSession();
+    const generation = epoch;
+    if (!activeSession.cookies.MUSIC_U) return new Map();
+    const profile = activeSession.profile || await account();
+    if (!profile?.id || generation !== epoch || activeSession !== session) return new Map();
+    if (playCountCache && playCountCache.generation === generation && playCountCache.uid === profile.id && Date.now() - playCountCache.at < 300000) {
+      return playCountCache.counts;
+    }
+    const data = await request("/api/v1/play/record", { uid: profile.id, type: 0 }, { session: activeSession, keepSession: true });
+    if (generation !== epoch || activeSession !== session) return new Map();
+    const counts = new Map();
+    for (const item of data.allData || []) {
+      const id = item?.song?.id ? String(item.song.id) : "";
+      const count = Number(item?.playCount) || 0;
+      if (id && count > 0) counts.set(id, count);
+    }
+    playCountCache = { generation, uid: profile.id, counts, at: Date.now() };
+    return counts;
+  } catch {
+    return new Map();
+  }
+}
+
 export async function playlist({ id }) {
-  const data = await request("/api/v6/playlist/detail", { id: idOf(id), n: PLAYLIST_LIMIT });
+  const [data, playCounts] = await Promise.all([
+    request("/api/v6/playlist/detail", { id: idOf(id), n: PLAYLIST_LIMIT }),
+    loadAllPlayCounts(),
+  ]);
   if (!data.playlist) throw fail("unavailable", "歌单不存在或当前账号无权访问");
   const source = data.playlist;
-  const ids = (source.trackIds || source.tracks || []).slice(0, PLAYLIST_LIMIT).map((track) => track.id);
+  const trackEntries = (source.trackIds || source.tracks || []).slice(0, PLAYLIST_LIMIT);
+  const ids = trackEntries.map((track) => track.id);
+  const atById = new Map(trackEntries.map((track) => [String(track.id), Number(track.at) || 0]));
   const result = toPlaylist(source);
-  result.tracks = (await songDetails(ids, source.tracks || [])).map(toTrack);
+  result.tracks = (await songDetails(ids, source.tracks || [])).map((track) => {
+    const mapped = toTrack(track);
+    mapped.addedAt = atById.get(mapped.id) || 0;
+    mapped.playCount = playCounts.get(mapped.id) || 0;
+    return mapped;
+  });
   if (source.trackCount > PLAYLIST_LIMIT) {
     result.description += `\n本版本载入前 ${PLAYLIST_LIMIT} 首（歌单共 ${source.trackCount} 首）。`;
   }
@@ -658,8 +700,13 @@ async function likedIDs() {
 
 export async function liked({ offset = 0 }) {
   offset = pageOffset(offset);
-  const ids = await likedIDs();
-  return { tracks: (await songDetails(ids.slice(offset, offset + PAGE_SIZE))).map(toTrack), more: offset + PAGE_SIZE < ids.length };
+  const [ids, playCounts] = await Promise.all([likedIDs(), loadAllPlayCounts()]);
+  const tracks = (await songDetails(ids.slice(offset, offset + PAGE_SIZE))).map((track) => {
+    const mapped = toTrack(track);
+    mapped.playCount = playCounts.get(mapped.id) || 0;
+    return mapped;
+  });
+  return { tracks, more: offset + PAGE_SIZE < ids.length };
 }
 
 export async function isLiked({ ids }) {
