@@ -866,3 +866,91 @@ test("eapi requests pair the desktop User-Agent with the PC payload and host", a
   assert.ok(seenHeaders["User-Agent"].includes(`NeteaseMusicDesktop/${seenPayload.data.header.appver}`));
   assert.ok(!seenHeaders["User-Agent"].includes("iPhone"));
 });
+
+test("playlist exposes commentCount and playlistComments deduplicates hot and paged comments", async () => {
+  const { plugin } = await setup(async (url) => {
+    if (url.includes("playlist/detail")) {
+      return response({ code: 200, playlist: { id: 9, name: "List", trackCount: 0, commentCount: 35, trackIds: [] } });
+    }
+    if (url.includes("/hotcomments/A_PL_0_9")) {
+      return response({ code: 200, hotComments: [{ commentId: 2, content: "Hot 2", likedCount: 9, user: { nickname: "A" } }] });
+    }
+    if (url.includes("/resource/comments/A_PL_0_9")) {
+      return response({
+        code: 200,
+        total: 2,
+        more: false,
+        comments: [
+          { commentId: 2, content: "Hot 2", likedCount: 9, user: { nickname: "A" } },
+          { commentId: 1, content: "Latest 1", likedCount: 0, user: { nickname: "B" } },
+        ],
+      });
+    }
+    throw new Error(`unexpected url ${url}`);
+  });
+
+  const pl = await plugin.playlist({ id: "9" });
+  assert.equal(pl.commentCount, 35);
+
+  const page = await plugin.playlistComments({ id: "9", offset: 0 });
+  assert.deepEqual(page.comments.map((c) => [c.id, c.text]), [["2", "Hot 2"], ["1", "Latest 1"]]);
+  assert.equal(page.total, 2);
+  assert.equal(page.more, false);
+});
+
+test("likeComment and likePlaylistComment send eapi like/unlike requests and require sign-in", async () => {
+  const { plugin: guest } = await setup(async () => { throw new Error("unexpected"); });
+  await assert.rejects(guest.likeComment({ trackId: "1", commentId: "2", on: true }), { code: "signIn" });
+  await assert.rejects(guest.likePlaylistComment({ id: "9", commentId: "2", on: true }), { code: "signIn" });
+
+  const calls = [];
+  const { plugin } = await setup(async (url, init) => {
+    if (url.includes("account/get")) return response({ code: 200, profile: { userId: 8, nickname: "Fixture" } });
+    calls.push(decode(init.body));
+    return response({ code: 200 });
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+
+  await plugin.likeComment({ trackId: "1", commentId: "10", on: true });
+  await plugin.likeComment({ trackId: "1", commentId: "10", on: false });
+  await plugin.likePlaylistComment({ id: "9", commentId: "20", on: true });
+
+  assert.deepEqual(
+    calls.map((c) => [c.path, c.data.threadId, c.data.commentId]),
+    [
+      ["/api/v1/comment/like", "R_SO_4_1", "10"],
+      ["/api/v1/comment/unlike", "R_SO_4_1", "10"],
+      ["/api/v1/comment/like", "A_PL_0_9", "20"],
+    ],
+  );
+});
+
+test("postComment and postPlaylistComment submit via eapi and format returned comments", async () => {
+  const { plugin: guest } = await setup(async () => { throw new Error("unexpected"); });
+  await assert.rejects(guest.postComment({ trackId: "1", text: "hi" }), { code: "signIn" });
+
+  const calls = [];
+  const { plugin } = await setup(async (url, init) => {
+    if (url.includes("account/get")) return response({ code: 200, profile: { userId: 8, nickname: "Me", avatarUrl: "http://p1.music.126.net/me.jpg" } });
+    const req = decode(init.body);
+    calls.push(req);
+    return response({
+      code: 200,
+      comment: { commentId: 99, content: req.data.content, time: 1700000000000, likedCount: 0, liked: false },
+    });
+  }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+
+  await assert.rejects(plugin.postPlaylistComment({ id: "9", text: "   " }), /不能为空/);
+  const trCm = await plugin.postComment({ trackId: "1", text: " 好听 " });
+  const plCm = await plugin.postPlaylistComment({ id: "9", text: " 好歌单 " });
+
+  assert.deepEqual(
+    calls.map((c) => [c.path, c.data.threadId, c.data.content]),
+    [
+      ["/api/resource/comments/add", "R_SO_4_1", "好听"],
+      ["/api/resource/comments/add", "A_PL_0_9", "好歌单"],
+    ],
+  );
+  assert.equal(trCm.author, "Me");
+  assert.equal(plCm.id, "99");
+  assert.equal(plCm.text, "好歌单");
+});
