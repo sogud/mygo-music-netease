@@ -127,6 +127,7 @@ function clearSession() {
   pendingStreams.clear();
   heartState = null;
   pendingHeart = null;
+  commentSnapshot = null;
   host.storage.remove("session");
 }
 
@@ -258,7 +259,8 @@ function toPlaylist(playlist) {
     id: String(playlist.id), name: playlist.name || "",
     imageUrl: artworkURL(playlist.coverImgUrl || playlist.picUrl),
     description: playlist.description || "", owner: playlist.creator?.nickname || "",
-    trackCount: playlist.trackCount || 0, saved: !!playlist.subscribed,
+    trackCount: playlist.trackCount || 0, commentCount: playlist.commentCount || 0,
+    saved: !!playlist.subscribed,
     fixed: Number(playlist.specialType) === 5,
     mine: !!session?.profile && String(playlist.creator?.userId) === session.profile.id,
   };
@@ -394,6 +396,7 @@ export async function signIn() {
       pendingHeart = null;
       profileCheckedAt = Date.now();
       likedCache = null;
+      commentSnapshot = null;
       persistSession();
       host.signInPrompt({ text: "登录成功" });
       return pending.profile;
@@ -768,18 +771,17 @@ export async function removeFromPlaylist({ id, trackIds }) {
   await manipulatePlaylistTracks("del", id, trackIds);
 }
 
-export async function comments({ trackId, offset = 0 }) {
-  const identity = trackIdentity(trackId);
+async function fetchThreadComments(thread, rid, offset = 0) {
   offset = pageOffset(offset);
   const activeSession = currentSession();
-  if (!commentSnapshot || commentSnapshot.thread !== identity.thread ||
+  if (!commentSnapshot || commentSnapshot.thread !== thread ||
       commentSnapshot.session !== activeSession || commentSnapshot.epoch !== epoch || offset === 0) {
-    const hot = await request(`/api/v1/resource/hotcomments/${identity.thread}`, {
-      rid: identity.program || identity.audio, limit: 20, offset: 0, beforeTime: 0,
+    const hot = await request(`/api/v1/resource/hotcomments/${thread}`, {
+      rid, limit: 20, offset: 0, beforeTime: 0,
     }, { session: activeSession, keepSession: true });
     const items = (hot.hotComments || []).slice().sort((a, b) => (b.likedCount || 0) - (a.likedCount || 0)).slice(0, 20);
     const unique = new Map(items.map(item => [String(item.commentId), item]));
-    commentSnapshot = { thread: identity.thread, session: activeSession, epoch, items: [...unique.values()], seen: new Set(unique.keys()), cursor: 0, more: true, total: 0 };
+    commentSnapshot = { thread, session: activeSession, epoch, items: [...unique.values()], seen: new Set(unique.keys()), cursor: 0, more: true, total: 0 };
   }
   const state = commentSnapshot;
   // Host offsets count displayed comments, not raw chronological records.
@@ -788,7 +790,7 @@ export async function comments({ trackId, offset = 0 }) {
     let stagnantPages = 0;
     for (let pages = 0; state.items.length < offset + PAGE_SIZE && state.more; pages++) {
       if (pages >= 50) throw new Error("评论分页过多，请重新打开评论后重试");
-      const data = await request(`/api/v1/resource/comments/${identity.thread}`, {
+      const data = await request(`/api/v1/resource/comments/${thread}`, {
         limit: PAGE_SIZE, offset: state.cursor,
       }, { session: activeSession, keepSession: true });
       if (!Array.isArray(data.comments) || (data.more && !data.comments.length)) throw new Error("网易云未返回完整的评论列表");
@@ -809,6 +811,86 @@ export async function comments({ trackId, offset = 0 }) {
   finally { if (state.pending === pending) state.pending = null; }
   if (state.session !== session || state.epoch !== epoch) throw new Error("账号状态已改变，请重试");
   return { comments: state.items.slice(offset, offset + PAGE_SIZE).map(toComment), total: state.total, more: offset + PAGE_SIZE < state.items.length || state.more };
+}
+
+export async function comments({ trackId, offset = 0 }) {
+  const identity = trackIdentity(trackId);
+  return fetchThreadComments(identity.thread, identity.program || identity.audio, offset);
+}
+
+export async function playlistComments({ id, playlistId, offset = 0 }) {
+  const pid = idOf(id ?? playlistId);
+  return fetchThreadComments(`A_PL_0_${pid}`, pid, offset);
+}
+
+async function toggleCommentLike(thread, commentId, on) {
+  const cid = idOf(commentId);
+  const activeSession = currentSession();
+  const generation = epoch;
+  await requireAccount();
+  checkAccountSession(activeSession, generation);
+  await eapi(on ? "/api/v1/comment/like" : "/api/v1/comment/unlike", { threadId: thread, commentId: cid }, {
+    session: activeSession, keepSession: true,
+  });
+  checkAccountSession(activeSession, generation);
+  if (commentSnapshot && commentSnapshot.thread === thread && commentSnapshot.session === activeSession && commentSnapshot.epoch === generation) {
+    const item = commentSnapshot.items.find((entry) => String(entry.commentId) === cid);
+    if (item && !!item.liked !== !!on) {
+      item.liked = !!on;
+      item.likedCount = Math.max(0, (Number(item.likedCount) || 0) + (on ? 1 : -1));
+    }
+  }
+}
+
+export async function likeComment({ trackId, commentId, on }) {
+  await toggleCommentLike(trackIdentity(trackId).thread, commentId, !!on);
+}
+
+export async function likePlaylistComment({ id, playlistId, commentId, on }) {
+  await toggleCommentLike(`A_PL_0_${idOf(id ?? playlistId)}`, commentId, !!on);
+}
+
+async function submitComment(thread, text) {
+  const content = String(text || "").trim();
+  if (!content) throw new Error("评论内容不能为空");
+  const activeSession = currentSession();
+  const generation = epoch;
+  const profile = await requireAccount();
+  checkAccountSession(activeSession, generation);
+  const data = await eapi("/api/resource/comments/add", { threadId: thread, content }, {
+    session: activeSession, keepSession: true,
+  });
+  checkAccountSession(activeSession, generation);
+  const raw = {
+    commentId: data.comment?.commentId ?? Date.now(),
+    content: data.comment?.content || content,
+    time: data.comment?.time || Date.now(),
+    likedCount: data.comment?.likedCount || 0,
+    liked: !!data.comment?.liked,
+    beReplied: data.comment?.beReplied,
+    user: {
+      nickname: data.comment?.user?.nickname || profile.name || "",
+      avatarUrl: data.comment?.user?.avatarUrl || profile.imageUrl || "",
+    },
+  };
+  if (commentSnapshot && commentSnapshot.thread === thread && commentSnapshot.session === activeSession && commentSnapshot.epoch === generation) {
+    const id = String(raw.commentId);
+    if (!commentSnapshot.seen.has(id)) {
+      commentSnapshot.seen.add(id);
+      commentSnapshot.items.unshift(raw);
+      commentSnapshot.total++;
+      commentSnapshot.cursor++;
+    }
+  }
+  return toComment(raw);
+}
+
+export async function postComment({ trackId, text }) {
+  return submitComment(trackIdentity(trackId).thread, text);
+}
+
+export async function postPlaylistComment({ id, playlistId, text }) {
+  return submitComment(`A_PL_0_${idOf(id ?? playlistId)}`, text);
 }
 
 // Word-timed lyrics (yrc) are served only by the desktop endpoint, and only
